@@ -17,9 +17,9 @@ from typing import List, Optional
 
 from skillopt_sleep import evidence
 from skillopt_sleep.backend import Backend, CursorBackendError, build_backend
-from skillopt_sleep.evidence import EvidenceLog
 from skillopt_sleep.config import SleepConfig, load_config
 from skillopt_sleep.dream import dream_consolidate
+from skillopt_sleep.evidence import EvidenceLog
 from skillopt_sleep.harvest_sources import harvest_for_config
 from skillopt_sleep.memory import ensure_skill_scaffold
 from skillopt_sleep.mine import group_tasks_by_skill_hint, mine
@@ -30,10 +30,8 @@ from skillopt_sleep.multi_skill import (
     skill_group_reports,
 )
 from skillopt_sleep.skill_resolver import resolve_skill, skill_search_roots
-from skillopt_sleep.staging import SkillProposal, StagingError, skill_proposal_rows
+from skillopt_sleep.staging import SkillProposal, StagingError, redact_secrets, skill_proposal_rows, write_staging
 from skillopt_sleep.staging import adopt as adopt_staging
-from skillopt_sleep.staging import redact_secrets
-from skillopt_sleep.staging import write_staging
 from skillopt_sleep.state import SleepState, _now_iso
 from skillopt_sleep.types import SessionDigest, SleepReport, TaskRecord
 

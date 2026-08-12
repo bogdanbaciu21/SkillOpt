@@ -36,8 +36,8 @@ from skillopt_sleep.config import load_config
 from skillopt_sleep.cycle import run_sleep_cycle
 from skillopt_sleep.harvest_sources import harvest_for_config
 from skillopt_sleep.mine import mine
-from skillopt_sleep.staging import StagingError, adopt as adopt_staging
-from skillopt_sleep.staging import adopt_skills, latest_staging, staged_skills
+from skillopt_sleep.staging import StagingError, adopt_skills, latest_staging, staged_skills
+from skillopt_sleep.staging import adopt as adopt_staging
 from skillopt_sleep.state import SleepState
 from skillopt_sleep.tasks_file import load_tasks_file, make_tasks_payload, write_tasks_file
 
@@ -554,7 +554,7 @@ def cmd_harvest(args) -> int:
 
 
 def cmd_schedule(args) -> int:
-    from skillopt_sleep.scheduler import schedule, list_scheduled
+    from skillopt_sleep.scheduler import list_scheduled, schedule
     cfg = _cfg_from_args(args)
     project = cfg.get("invoked_project") or os.getcwd()
     ok, msg = schedule(project, backend=cfg.get("backend", "mock"),

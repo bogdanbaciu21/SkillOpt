@@ -11,6 +11,7 @@ import os
 import stat
 import tempfile
 import unittest
+from unittest import mock
 
 from skillopt_sleep.staging import (
     SkillProposal,
@@ -374,6 +375,302 @@ class TestAdoptSkillCli(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertEqual(_read(night.alpha_live), "# alpha v2\n")
             self.assertEqual(_read(night.beta_live), "# beta v1\n")
+
+    def test_all_skills_flag_promotes_every_staged_skill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            claude_home = os.path.join(tmp, ".claude")
+            os.makedirs(claude_home, exist_ok=True)
+            rc, out = self._cli([
+                "adopt", "--project", tmp, "--claude-home", claude_home,
+                "--all-skills",
+            ])
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(_read(night.alpha_live), "# alpha v2\n")
+            self.assertEqual(_read(night.beta_live), "# beta v2\n")
+
+    def test_repeated_skill_flags_adopt_the_named_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            claude_home = os.path.join(tmp, ".claude")
+            os.makedirs(claude_home, exist_ok=True)
+            rc, out = self._cli([
+                "adopt", "--project", tmp, "--claude-home", claude_home,
+                "--skill", "alpha", "--skill", "beta",
+            ])
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(_read(night.alpha_live), "# alpha v2\n")
+            self.assertEqual(_read(night.beta_live), "# beta v2\n")
+
+    def test_skill_and_all_skills_together_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            claude_home = os.path.join(tmp, ".claude")
+            os.makedirs(claude_home, exist_ok=True)
+            rc, out = self._cli([
+                "adopt", "--project", tmp, "--claude-home", claude_home,
+                "--skill", "alpha", "--all-skills",
+            ])
+            self.assertEqual(rc, 2)
+            self.assertIn("not both", out)
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+            self.assertEqual(_read(night.beta_live), "# beta v1\n")
+
+    def test_legacy_night_bare_adopt_still_copies_the_managed_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            live = os.path.join(tmp, "live", "SKILL.md")
+            memory = os.path.join(tmp, "live", "CLAUDE.md")
+            _write(live, "# live v1\n")
+            _write(memory, "# mem v1\n")
+            write_staging(
+                tmp, report=SleepReport(night=1, project=tmp, accepted=True),
+                proposed_skill="# live v2\n", proposed_memory="# mem v2\n",
+                live_skill_path=live, live_memory_path=memory,
+                report_md="# report\n",
+            )
+            claude_home = os.path.join(tmp, ".claude")
+            os.makedirs(claude_home, exist_ok=True)
+            rc, out = self._cli([
+                "adopt", "--project", tmp, "--claude-home", claude_home,
+            ])
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(_read(live), "# live v2\n")
+            self.assertEqual(_read(memory), "# mem v2\n")
+
+    def test_skill_flag_on_a_legacy_night_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            live = os.path.join(tmp, "live", "SKILL.md")
+            _write(live, "# live v1\n")
+            write_staging(
+                tmp, report=SleepReport(night=1, project=tmp, accepted=True),
+                proposed_skill="# live v2\n", proposed_memory=None,
+                live_skill_path=live,
+                live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                report_md="# report\n",
+            )
+            claude_home = os.path.join(tmp, ".claude")
+            os.makedirs(claude_home, exist_ok=True)
+            rc, out = self._cli([
+                "adopt", "--project", tmp, "--claude-home", claude_home,
+                "--skill", "alpha",
+            ])
+            self.assertEqual(rc, 2)
+            self.assertIn("no per-skill", out)
+            self.assertEqual(_read(live), "# live v1\n")
+
+
+class TestAdoptTimeRevalidationMega(unittest.TestCase):
+    def test_casefold_live_path_collision_is_refused_at_adopt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            manifest_path = os.path.join(night.staging, "manifest.json")
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            live_root = os.path.dirname(os.path.dirname(night.alpha_live))
+            manifest["skills"][1]["live_skill_path"] = os.path.join(
+                live_root, "ALPHA", "SKILL.md")
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            with self.assertRaises(StagingError):
+                adopt_skills(night.staging)
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+            self.assertEqual(_read(night.beta_live), "# beta v1\n")
+
+    def test_symlink_realpath_collision_is_refused_at_adopt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            alias = os.path.join(night.live_root, "alias", "SKILL.md")
+            os.makedirs(os.path.dirname(alias), exist_ok=True)
+            try:
+                os.symlink(night.alpha_live, alias)
+            except OSError:
+                self.skipTest("symlinks unavailable")
+            manifest_path = os.path.join(night.staging, "manifest.json")
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            manifest["skills"][1]["live_skill_path"] = alias
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            with self.assertRaises(StagingError):
+                adopt_skills(night.staging)
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+            self.assertEqual(_read(night.beta_live), "# beta v1\n")
+
+    def test_receipt_write_failure_restores_a_previous_receipt(self):
+        from skillopt_sleep import staging as staging_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            adopt_skills(night.staging, ["alpha"])
+            receipt_path = os.path.join(night.staging, "adopted_skills.json")
+            previous = _read(receipt_path)
+            real_write = staging_mod._write_atomic
+
+            def boom(path, text):
+                if os.path.basename(path) == "adopted_skills.json":
+                    raise OSError("disk full")
+                return real_write(path, text)
+
+            with mock.patch.object(staging_mod, "_write_atomic", side_effect=boom):
+                with self.assertRaises(OSError):
+                    adopt_skills(night.staging, ["beta"])
+            self.assertEqual(_read(night.beta_live), "# beta v1\n")
+            self.assertEqual(_read(night.alpha_live), "# alpha v2\n")
+            self.assertEqual(_read(receipt_path), previous)
+
+
+def _accepted_group(name, body):
+    from skillopt_sleep.consolidate import ConsolidationResult
+    from skillopt_sleep.multi_skill import CONSOLIDATED, GroupConsolidation
+
+    result = ConsolidationResult(
+        accepted=True, gate_action="accept_new_best",
+        baseline_score=0.1, candidate_score=0.2,
+        new_skill=body, new_memory="",
+        applied_edits=[], rejected_edits=[],
+        holdout_baseline=0.1, holdout_candidate=0.2,
+    )
+    return GroupConsolidation(
+        skill_name=name, status=CONSOLIDATED, result=result, n_tasks=2,
+    )
+
+
+class TestSkillProposalsFromGroups(unittest.TestCase):
+    def test_skips_managed_catch_all_and_unresolved_names(self):
+        from skillopt_sleep.config import load_config
+        from skillopt_sleep.cycle import _skill_proposals_from_groups
+
+        with tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            live = os.path.join(claude_home, "skills", "research-skill", "SKILL.md")
+            _write(live, "# research v1\n")
+            cfg = load_config(
+                claude_home=claude_home,
+                managed_skill_name="skillopt-sleep-learned",
+            )
+            proposals = _skill_proposals_from_groups(
+                cfg,
+                {
+                    "skillopt-sleep-learned": _accepted_group(
+                        "skillopt-sleep-learned", "# managed v2\n"),
+                    "research-skill": _accepted_group(
+                        "research-skill", "# research v2\n"),
+                    "ghost-skill": _accepted_group(
+                        "ghost-skill", "# ghost v2\n"),
+                },
+                "skillopt-sleep-learned",
+            )
+            names = [p.skill_name for p in proposals]
+            self.assertEqual(names, ["research-skill"])
+            self.assertEqual(proposals[0].live_skill_path, os.path.realpath(live))
+            self.assertEqual(proposals[0].proposed_skill, "# research v2\n")
+
+    def test_skips_a_second_skill_that_resolves_to_the_same_live_file(self):
+        from skillopt_sleep.config import load_config
+        from skillopt_sleep.cycle import _skill_proposals_from_groups
+
+        with tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            skills = os.path.join(claude_home, "skills")
+            research = os.path.join(skills, "research-skill")
+            alias = os.path.join(skills, "alias-skill")
+            _write(os.path.join(research, "SKILL.md"), "# research v1\n")
+            try:
+                os.symlink(research, alias)
+            except OSError:
+                self.skipTest("symlinks unavailable")
+            cfg = load_config(claude_home=claude_home)
+            proposals = _skill_proposals_from_groups(
+                cfg,
+                {
+                    "research-skill": _accepted_group(
+                        "research-skill", "# research v2\n"),
+                    "alias-skill": _accepted_group(
+                        "alias-skill", "# alias v2\n"),
+                },
+                "skillopt-sleep-learned",
+            )
+            self.assertEqual([p.skill_name for p in proposals], ["research-skill"])
+
+
+class TestCycleStagingGaps(unittest.TestCase):
+    def _hinted_tasks(self):
+        from dataclasses import replace
+
+        from skillopt_sleep.experiments.personas import programmer_persona, researcher_persona
+        from skillopt_sleep.mine import assign_splits
+
+        research = assign_splits(researcher_persona(), holdout_fraction=0.34, seed=42)
+        programming = assign_splits(programmer_persona(), holdout_fraction=0.34, seed=1)
+        tagged = [replace(t, skill_hint="research-skill") for t in research]
+        tagged += [replace(t, id=f"prog-{t.id}", skill_hint="programming-skill")
+                   for t in programming]
+        return tagged
+
+    def test_missing_live_skill_is_skipped_not_aborted(self):
+        from skillopt_sleep.config import load_config
+        from skillopt_sleep.cycle import run_sleep_cycle
+
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            research_live = os.path.join(
+                claude_home, "skills", "research-skill", "SKILL.md")
+            _write(research_live, "# research-skill v1\n")
+            cfg = load_config(
+                invoked_project=proj, projects="invoked", backend="mock",
+                claude_home=claude_home,
+                managed_skill_name="skillopt-sleep-learned", auto_adopt=False,
+                multi_skill_report=True,
+            )
+            outcome = run_sleep_cycle(cfg, seed_tasks=self._hinted_tasks())
+            names = [r["skill_name"] for r in staged_skills(outcome.staging_dir)]
+            self.assertEqual(names, ["research-skill"])
+            self.assertFalse(os.path.isfile(os.path.join(
+                outcome.staging_dir, "proposed_SKILL.programming-skill.md")))
+
+    def test_report_off_stages_no_per_skill_proposals(self):
+        from skillopt_sleep.config import load_config
+        from skillopt_sleep.cycle import run_sleep_cycle
+
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            _write(os.path.join(claude_home, "skills", "research-skill", "SKILL.md"),
+                   "# research-skill v1\n")
+            _write(os.path.join(claude_home, "skills", "programming-skill", "SKILL.md"),
+                   "# programming-skill v1\n")
+            cfg = load_config(
+                invoked_project=proj, projects="invoked", backend="mock",
+                claude_home=claude_home,
+                managed_skill_name="skillopt-sleep-learned", auto_adopt=False,
+                multi_skill_report=False,
+            )
+            outcome = run_sleep_cycle(cfg, seed_tasks=self._hinted_tasks())
+            self.assertEqual(staged_skills(outcome.staging_dir), [])
+
+    def test_auto_adopt_does_not_promote_per_skill_live_files(self):
+        from skillopt_sleep.config import load_config
+        from skillopt_sleep.cycle import run_sleep_cycle
+
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            research_live = os.path.join(
+                claude_home, "skills", "research-skill", "SKILL.md")
+            programming_live = os.path.join(
+                claude_home, "skills", "programming-skill", "SKILL.md")
+            _write(research_live, "# research-skill v1\n")
+            _write(programming_live, "# programming-skill v1\n")
+            cfg = load_config(
+                invoked_project=proj, projects="invoked", backend="mock",
+                claude_home=claude_home,
+                managed_skill_name="skillopt-sleep-learned", auto_adopt=True,
+                multi_skill_report=True,
+            )
+            outcome = run_sleep_cycle(cfg, seed_tasks=self._hinted_tasks())
+            self.assertEqual(_read(research_live), "# research-skill v1\n")
+            self.assertEqual(_read(programming_live), "# programming-skill v1\n")
+            names = [r["skill_name"] for r in staged_skills(outcome.staging_dir)]
+            self.assertIn("research-skill", names)
+            self.assertIn("programming-skill", names)
 
 
 if __name__ == "__main__":
