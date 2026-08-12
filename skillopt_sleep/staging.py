@@ -553,6 +553,57 @@ def _selected_rows(
     return [row for row in rows if str(row.get("skill_name", "")) in chosen]
 
 
+def _revalidate_selected_skill_rows(rows: Sequence[Dict[str, Any]]) -> None:
+    """Re-run uniqueness and live-target checks at adoption time.
+
+    Staging already refused collisions, but the manifest can be edited between
+    staging and adopt. A tampered pair that shares a skill name, a staged
+    filename, or a live target must fail here with no writes. Live paths are
+    also compared by realpath so a symlink cannot hide a second claim on one
+    file, and a live path that exists as something other than a file is
+    refused rather than overwritten.
+    """
+    skill_proposal_rows([
+        SkillProposal(
+            str(row.get("skill_name") or ""),
+            "",
+            str(row.get("live_skill_path") or ""),
+        )
+        for row in rows
+    ])
+    seen_real: Dict[str, str] = {}
+    for row in rows:
+        name = _safe_skill_name(row.get("skill_name"))
+        live = _safe_live_path(row.get("live_skill_path"))
+        if not name or not live:
+            continue
+        try:
+            real = os.path.realpath(live)
+        except OSError:
+            real = live
+        key = real.casefold()
+        if key in seen_real:
+            raise StagingError(
+                f"skills {seen_real[key]!r} and {name!r} target the same file: {live}"
+            )
+        seen_real[key] = name
+        if os.path.lexists(live) and not os.path.isfile(live):
+            raise StagingError(
+                f"live skill path for {name!r} exists and is not a file: {live}"
+            )
+
+
+def _restore_live_writes(done: Sequence[tuple]) -> None:
+    """Restore live files written by a failed adoption, newest first."""
+    for live, original in reversed(done):
+        if original is None:
+            if os.path.exists(live):
+                os.unlink(live)
+        else:
+            with open(live, "wb") as f:
+                f.write(original)
+
+
 def adopt_skills(
     staging_dir: str, skill_names: Optional[Sequence[str]] = None
 ) -> List[AdoptedSkill]:
@@ -562,14 +613,17 @@ def adopt_skills(
     staged skill. Nothing is adopted implicitly and skills outside the selection
     are never touched.
 
-    Every selected proposal is validated first, each live file is backed up, and
-    the writes are rolled back as a set if any one of them fails, so a partial
-    adoption never survives. Returns a before/after sha256 receipt per skill and
-    also writes them to ``adopted_skills.json`` in the staging directory.
+    Every selected proposal is validated first, including a second uniqueness
+    and live-target check against the current manifest and filesystem. Each
+    live file is backed up, and the writes — including ``adopted_skills.json``
+    — are rolled back as a set if any one of them fails, so a partial adoption
+    never survives. Returns a before/after sha256 receipt per skill and also
+    writes them to ``adopted_skills.json`` in the staging directory.
     """
     rows = _selected_rows(staged_skills(staging_dir), skill_names)
     if not rows:
         return []
+    _revalidate_selected_skill_rows(rows)
 
     plan: List[tuple] = []
     for row in rows:
@@ -596,6 +650,11 @@ def adopt_skills(
     backup_dir = os.path.join(staging_dir, "backup", "skills")
     receipts: List[AdoptedSkill] = []
     done: List[tuple] = []   # (live, original_bytes or None) for rollback
+    receipt_path = os.path.join(staging_dir, "adopted_skills.json")
+    receipt_original = None
+    if os.path.isfile(receipt_path):
+        with open(receipt_path, "rb") as f:
+            receipt_original = f.read()
     try:
         for name, live, staged in plan:
             with open(staged, encoding="utf-8") as f:
@@ -616,20 +675,18 @@ def adopt_skills(
                 skill_name=name, live_skill_path=live, sha256_before=before,
                 sha256_after=_sha256_text(proposed), backup_path=backup_path,
             ))
+        _write_atomic(
+            receipt_path,
+            json.dumps([r.__dict__ for r in receipts], ensure_ascii=False, indent=2),
+        )
     except BaseException:
-        for live, original in reversed(done):
-            if original is None:
-                if os.path.exists(live):
-                    os.unlink(live)
-            else:
-                with open(live, "wb") as f:
-                    f.write(original)
+        _restore_live_writes(done)
+        if receipt_original is not None:
+            with open(receipt_path, "wb") as f:
+                f.write(receipt_original)
+        elif os.path.isfile(receipt_path):
+            os.unlink(receipt_path)
         raise
-
-    _write_atomic(
-        os.path.join(staging_dir, "adopted_skills.json"),
-        json.dumps([r.__dict__ for r in receipts], ensure_ascii=False, indent=2),
-    )
     return receipts
 
 

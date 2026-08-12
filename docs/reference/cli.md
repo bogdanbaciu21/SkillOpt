@@ -146,6 +146,11 @@ Actions are `run`, `dry-run`, `status`, `adopt`, `harvest`, `schedule`, and
 | `--progress` / `--json` | Progress or machine-readable output |
 | `--auto-adopt` | Apply an accepted staged proposal automatically |
 
+`adopt` also accepts `--skill NAME` (repeatable) and `--all-skills` for a night
+that staged per-skill proposals. Bare `adopt` on that night lists the names and
+exits instead of promoting every skill. See
+[multi-skill staging](../sleep/multi-skill-staging.md).
+
 The `mock` and `handoff` backends make no network calls. A real backend sends
 mining, replay, judging, and reflection prompts derived from harvested
 transcripts and tasks to its selected provider. Review that provider's

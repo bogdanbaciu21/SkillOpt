@@ -234,6 +234,147 @@ class TestAdoptSkillSubset(unittest.TestCase):
             self.assertTrue(os.path.exists(
                 os.path.join(night.staging, "proposed_SKILL.alpha.md")))
 
+    def test_tampered_duplicate_live_paths_are_refused_at_adopt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            manifest_path = os.path.join(night.staging, "manifest.json")
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            manifest["skills"][1]["live_skill_path"] = night.alpha_live
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            with self.assertRaises(StagingError):
+                adopt_skills(night.staging)
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+            self.assertEqual(_read(night.beta_live), "# beta v1\n")
+            self.assertFalse(
+                os.path.exists(os.path.join(night.staging, "adopted_skills.json")))
+
+    def test_live_target_that_is_not_a_file_is_refused_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            os.unlink(night.beta_live)
+            os.mkdir(night.beta_live)
+            with self.assertRaises(StagingError):
+                adopt_skills(night.staging, ["beta"])
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+            self.assertTrue(os.path.isdir(night.beta_live))
+
+    def test_receipt_write_failure_rolls_back_live_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            os.makedirs(os.path.join(night.staging, "adopted_skills.json"))
+            with self.assertRaises(OSError):
+                adopt_skills(night.staging, ["alpha"])
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+            self.assertEqual(_read(night.beta_live), "# beta v1\n")
+
+
+class TestCycleStagesResolvedSkillSubset(unittest.TestCase):
+    """run_sleep_cycle stages resolved skills; adopt promotes only the subset."""
+
+    def _hinted_tasks(self):
+        from dataclasses import replace
+
+        from skillopt_sleep.experiments.personas import programmer_persona, researcher_persona
+        from skillopt_sleep.mine import assign_splits
+
+        research = assign_splits(researcher_persona(), holdout_fraction=0.34, seed=42)
+        programming = assign_splits(programmer_persona(), holdout_fraction=0.34, seed=1)
+        tagged = [replace(t, skill_hint="research-skill") for t in research]
+        tagged += [replace(t, id=f"prog-{t.id}", skill_hint="programming-skill")
+                   for t in programming]
+        return tagged
+
+    def test_cycle_stages_both_skills_and_subset_adopt_touches_only_one(self):
+        from skillopt_sleep.config import load_config
+        from skillopt_sleep.cycle import run_sleep_cycle
+
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            research_live = os.path.join(
+                claude_home, "skills", "research-skill", "SKILL.md")
+            programming_live = os.path.join(
+                claude_home, "skills", "programming-skill", "SKILL.md")
+            _write(research_live, "# research-skill v1\n")
+            _write(programming_live, "# programming-skill v1\n")
+            cfg = load_config(
+                invoked_project=proj, projects="invoked", backend="mock",
+                claude_home=claude_home,
+                managed_skill_name="skillopt-sleep-learned", auto_adopt=False,
+                multi_skill_report=True,
+            )
+            outcome = run_sleep_cycle(cfg, seed_tasks=self._hinted_tasks())
+            rows = staged_skills(outcome.staging_dir)
+            names = [r["skill_name"] for r in rows]
+            self.assertIn("research-skill", names)
+            self.assertIn("programming-skill", names)
+            self.assertTrue(os.path.isfile(os.path.join(
+                outcome.staging_dir, "proposed_SKILL.research-skill.md")))
+            self.assertTrue(os.path.isfile(os.path.join(
+                outcome.staging_dir, "proposed_SKILL.programming-skill.md")))
+            self.assertEqual(_read(research_live), "# research-skill v1\n")
+            self.assertEqual(_read(programming_live), "# programming-skill v1\n")
+
+            receipts = adopt_skills(outcome.staging_dir, ["research-skill"])
+            self.assertEqual([r.skill_name for r in receipts], ["research-skill"])
+            self.assertNotEqual(_read(research_live), "# research-skill v1\n")
+            self.assertEqual(_read(programming_live), "# programming-skill v1\n")
+
+
+class TestAdoptSkillCli(unittest.TestCase):
+    def _cli(self, argv):
+        import contextlib
+        import io
+
+        from skillopt_sleep.__main__ import main
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = main(argv)
+        return rc, stdout.getvalue()
+
+    def test_status_lists_staged_skill_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            claude_home = os.path.join(tmp, ".claude")
+            os.makedirs(claude_home, exist_ok=True)
+            rc, out = self._cli([
+                "status", "--project", tmp, "--claude-home", claude_home, "--json",
+            ])
+            self.assertEqual(rc, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload["staged_skills"], ["alpha", "beta"])
+            self.assertEqual(payload["latest_staging"], night.staging)
+
+    def test_bare_adopt_on_a_multi_skill_night_lists_and_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            TwoSkillNight(tmp)
+            claude_home = os.path.join(tmp, ".claude")
+            os.makedirs(claude_home, exist_ok=True)
+            rc, out = self._cli([
+                "adopt", "--project", tmp, "--claude-home", claude_home,
+            ])
+            self.assertEqual(rc, 2)
+            self.assertIn("--skill", out)
+            self.assertIn("alpha", out)
+            self.assertIn("beta", out)
+            self.assertEqual(_read(os.path.join(tmp, "live", "alpha", "SKILL.md")),
+                             "# alpha v1\n")
+
+    def test_adopt_skill_flag_promotes_only_the_named_skill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            claude_home = os.path.join(tmp, ".claude")
+            os.makedirs(claude_home, exist_ok=True)
+            rc, out = self._cli([
+                "adopt", "--project", tmp, "--claude-home", claude_home,
+                "--skill", "alpha",
+            ])
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(_read(night.alpha_live), "# alpha v2\n")
+            self.assertEqual(_read(night.beta_live), "# beta v1\n")
+
 
 if __name__ == "__main__":
     unittest.main()

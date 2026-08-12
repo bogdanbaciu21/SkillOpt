@@ -84,6 +84,7 @@ skillopt-sleep dry-run      # harvest + mine + replay, report only; stages nothi
 skillopt-sleep run          # a full nightly cycle; the proposal is staged for review
 skillopt-sleep status       # show state + the latest staged proposal
 skillopt-sleep adopt        # apply the latest staged proposal
+skillopt-sleep adopt --skill NAME   # adopt one staged skill (repeatable)
 skillopt-sleep schedule     # install a nightly cron entry for this project
 ```
 
@@ -299,9 +300,11 @@ gate keeps the worst case bounded; keep it **on** by default.
 
 ## Learn more
 
-Staging a proposal for more than one skill, and adopting a reviewed subset of
-them with backups and hash receipts, is documented in
-[`docs/sleep/multi-skill-staging.md`](multi-skill-staging.md).
+The **low-level** API for staging one proposal per skill and adopting a reviewed
+subset (`staged_skills` / `adopt_skills`, plus `status` and `adopt --skill`) is
+documented in [`docs/sleep/multi-skill-staging.md`](multi-skill-staging.md).
+That page also states what this slice does **not** yet do: an end-to-end
+nightly workflow where each group edits its own live `SKILL.md`.
 
 See the [SkillOpt documentation index](../index.md), the
 [CLI reference](../reference/cli.md), and the integration-specific READMEs under

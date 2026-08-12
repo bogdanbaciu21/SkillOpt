@@ -1,13 +1,36 @@
 # Multi-skill staging and subset adoption
 
-A night can stage a proposal for more than one skill. Adoption stays explicit:
-staging only ever writes into the staging directory, and `adopt_skills()` copies
-a **reviewed subset** over the live files, with a backup and a hash receipt per
-skill.
+There are two layers here. Do not collapse them.
+
+1. **Low-level adoption API** — `staged_skills()` / `adopt_skills()`, plus
+   `skillopt-sleep status` and `skillopt-sleep adopt --skill`. This slice is
+   complete: a night can stage one proposal file per resolved skill, a reviewer
+   can list those names, and an explicit subset is copied over the live files
+   with a backup and a hash receipt.
+2. **End-to-end multi-skill nightly workflow** — each hinted group loading and
+   editing *its own* live `SKILL.md`, then promoting that file without a human
+   picking names. That workflow is **not** this slice. `multi_skill_report`
+   still consolidates every group from the **managed** skill document; staging
+   only *targets* the resolved live path when the name is `FOUND` and unique.
 
 Nothing here changes a single-managed-skill night. If a night stages no per-skill
 proposals, the staging directory and `manifest.json` are exactly the legacy ones
 and `skillopt-sleep adopt` keeps working unchanged.
+
+## Nightly wiring (`run_sleep_cycle`)
+
+When `multi_skill_report` is on and hinted groups pass the gate:
+
+- the managed catch-all is **not** staged as a per-skill proposal (it stays on
+  `proposed_SKILL.md`);
+- each accepted group name is resolved with `resolve_skill` against
+  `skill_search_roots(cfg)`;
+- only `FOUND` unique live paths become `SkillProposal` rows;
+- missing, ambiguous, rejected, or colliding names are skipped rather than
+  aborting the night.
+
+Review remains explicit. `auto_adopt` still only runs the legacy `adopt()`
+pair; it never silently promotes every staged skill.
 
 ## Staging layout
 
@@ -59,6 +82,8 @@ file. A refused fan-out writes no `manifest.json`, so the folder is not adoptabl
 
 ## Adopting a reviewed subset
 
+Low-level API:
+
 ```python
 from skillopt_sleep.staging import adopt_skills, latest_staging, staged_skills
 
@@ -69,12 +94,31 @@ receipts = adopt_skills(staging, ["alpha"])             # beta is left alone
 receipts[0].sha256_before, receipts[0].sha256_after
 ```
 
+CLI:
+
+```text
+python -m skillopt_sleep status --project PATH
+python -m skillopt_sleep adopt --project PATH --skill alpha
+python -m skillopt_sleep adopt --project PATH --skill alpha --skill beta
+python -m skillopt_sleep adopt --project PATH --all-skills
+```
+
+On a multi-skill night, bare `adopt` does **not** silently promote every staged
+skill. It lists the names and asks for `--skill` or `--all-skills`. Legacy
+nights (no `skills` in the manifest) still use `adopt()` unchanged.
+
 - `skill_names=None` adopts every staged skill; `[]` adopts nothing.
-- An unknown or repeated name, an unsafe manifest row, or a missing proposal file
-  raises `StagingError` **before** anything is written.
+- An unknown or repeated name, an unsafe manifest row, a missing proposal file,
+  or a uniqueness / live-target collision raises `StagingError` **before**
+  anything is written.
+- Uniqueness and live-target nonexistence are re-checked **at adoption time**,
+  not only at staging, so a tampered manifest that points two skills at one
+  file (including via casefold or realpath/symlink) is refused with no writes.
+  A live path that exists as something other than a file is also refused.
 - Each live file is backed up to `backup/skills/<skill>/` and written atomically.
-- If any write fails, every file in the selection is restored (and files that did
-  not exist before are removed), so a partial adoption never survives.
+- If any write fails — including `adopted_skills.json` — every live file in the
+  selection is restored (and files that did not exist before are removed), so a
+  partial adoption never survives.
 - Receipts (`skill_name`, `live_skill_path`, `sha256_before`, `sha256_after`,
   `backup_path`) are returned and written to `adopted_skills.json` in the staging
   directory. An empty `sha256_before` means the skill had no live file yet.

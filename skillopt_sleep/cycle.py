@@ -25,9 +25,12 @@ from skillopt_sleep.memory import ensure_skill_scaffold
 from skillopt_sleep.mine import group_tasks_by_skill_hint, mine
 from skillopt_sleep.multi_skill import (
     SkillGroup,
+    accepted_group_skills,
     consolidate_groups,
     skill_group_reports,
 )
+from skillopt_sleep.skill_resolver import resolve_skill, skill_search_roots
+from skillopt_sleep.staging import SkillProposal, StagingError, skill_proposal_rows
 from skillopt_sleep.staging import adopt as adopt_staging
 from skillopt_sleep.staging import redact_secrets
 from skillopt_sleep.staging import write_staging
@@ -272,6 +275,36 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
         lines.append("")
     lines.append("_Review, then run `/sleep adopt` to apply, or discard this folder._")
     return "\n".join(lines)
+
+
+def _skill_proposals_from_groups(
+    cfg: SleepConfig,
+    group_outcomes: dict,
+    managed_name: str,
+) -> List[SkillProposal]:
+    """Stage per-skill proposals for accepted groups whose names resolve uniquely.
+
+    Groups still consolidate from the managed document; this only chooses the
+    live ``SKILL.md`` each accepted name would replace. Unresolved, ambiguous,
+    rejected, or colliding names are skipped so one bad hint cannot abort the
+    night. The managed catch-all is never staged here — it stays on the legacy
+    ``proposed_SKILL.md`` path.
+    """
+    roots = skill_search_roots(cfg)
+    proposals: List[SkillProposal] = []
+    for name, new_skill in accepted_group_skills(group_outcomes).items():
+        if name == managed_name:
+            continue
+        resolution = resolve_skill(name, roots)
+        if not resolution.ok:
+            continue
+        candidate = SkillProposal(name, new_skill, resolution.path)
+        try:
+            skill_proposal_rows(proposals + [candidate])
+        except StagingError:
+            continue
+        proposals.append(candidate)
+    return proposals
 
 
 def run_sleep_cycle(
@@ -532,12 +565,13 @@ def run_sleep_cycle(
     # automatic; a night whose evidence produces only the catch-all group adds
     # no rows and no calls.
     #
-    # Each group currently starts from the same managed document. Resolving a
-    # hinted group to its own live SKILL.md is the resolver's job and is not
-    # wired here yet, so a row describes what that group's evidence did to the
-    # managed skill, not to a separate file.
+    # Each group currently starts from the same managed document. Staging
+    # targets the resolved live SKILL.md when the name is FOUND and unique;
+    # the row still describes what that group's evidence did to the managed
+    # skill, not a separately loaded live file.
+    group_outcomes = {}
+    managed_name = cfg.get("managed_skill_name", "skillopt-sleep-learned")
     if cfg.get("multi_skill_report", False):
-        managed_name = cfg.get("managed_skill_name", "skillopt-sleep-learned")
         grouped = group_tasks_by_skill_hint(tasks, managed_name)
         only_catch_all = len(grouped) == 1 and managed_name in grouped
         if grouped and not only_catch_all:
@@ -574,6 +608,7 @@ def run_sleep_cycle(
         report_md = _render_report_md(report, cfg)
         proposed_skill = result.new_skill if (cfg.get("evolve_skill") and result.accepted) else None
         proposed_memory = result.new_memory if (cfg.get("evolve_memory") and result.accepted) else None
+        skill_proposals = _skill_proposals_from_groups(cfg, group_outcomes, managed_name)
         staging_dir = write_staging(
             project,
             report=report,
@@ -583,6 +618,7 @@ def run_sleep_cycle(
             live_memory_path=live_memory_path,
             report_md=report_md,
             out_dir=staging_dir_pre,
+            skill_proposals=skill_proposals,
         )
         if ev is not None:
             ev.log("stage", "staged", staging_dir=staging_dir,

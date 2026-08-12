@@ -4,6 +4,7 @@
     python -m skillopt_sleep dry-run    # same but report only, no staging/adopt
     python -m skillopt_sleep status     # show state + latest staged proposal
     python -m skillopt_sleep adopt      # apply the latest staged proposal (with backup)
+    python -m skillopt_sleep adopt --skill NAME   # adopt one staged skill (repeatable)
     python -m skillopt_sleep harvest    # just print what would be mined (debug)
 
 Common flags:
@@ -35,8 +36,8 @@ from skillopt_sleep.config import load_config
 from skillopt_sleep.cycle import run_sleep_cycle
 from skillopt_sleep.harvest_sources import harvest_for_config
 from skillopt_sleep.mine import mine
-from skillopt_sleep.staging import adopt as adopt_staging
-from skillopt_sleep.staging import latest_staging
+from skillopt_sleep.staging import StagingError, adopt as adopt_staging
+from skillopt_sleep.staging import adopt_skills, latest_staging, staged_skills
 from skillopt_sleep.state import SleepState
 from skillopt_sleep.tasks_file import load_tasks_file, make_tasks_payload, write_tasks_file
 
@@ -222,7 +223,17 @@ def _print_run_report(outcome, args, task_meta: Dict[str, Any]) -> None:
         if outcome.staging_dir:
             print(f"[sleep] staged: {outcome.staging_dir}")
             if not outcome.adopted:
-                print("[sleep] review it, then: python -m skillopt_sleep adopt")
+                names = []
+                try:
+                    names = [r["skill_name"] for r in staged_skills(outcome.staging_dir)]
+                except Exception:
+                    names = []
+                if names:
+                    listed = " ".join(f"--skill {n}" for n in names)
+                    print("[sleep] review it, then adopt a subset:")
+                    print(f"        python -m skillopt_sleep adopt {listed}")
+                else:
+                    print("[sleep] review it, then: python -m skillopt_sleep adopt")
         if outcome.adopted:
             print(f"[sleep] auto-adopted: {', '.join(outcome.adopted_paths)}")
 
@@ -414,6 +425,12 @@ def cmd_status(args) -> int:
     state = SleepState.load(cfg.state_path)
     project = cfg.get("invoked_project") or os.getcwd()
     latest = latest_staging(project)
+    skills = []
+    if latest:
+        try:
+            skills = staged_skills(latest)
+        except Exception:
+            skills = []
     info = {
         "night": state.night,
         "state_path": cfg.state_path,
@@ -421,6 +438,7 @@ def cmd_status(args) -> int:
         "history_tail": state.data.get("history", [])[-5:],
         "latest_staging": latest,
         "slow_memory_chars": len(state.slow_memory),
+        "staged_skills": [r.get("skill_name", "") for r in skills],
     }
     if args.json:
         print(json.dumps(info, ensure_ascii=False, indent=2))
@@ -429,6 +447,10 @@ def cmd_status(args) -> int:
         print(f"[sleep] project: {project}")
         if latest:
             print(f"[sleep] latest staged proposal: {latest}")
+            if skills:
+                print("[sleep] staged skills:")
+                for row in skills:
+                    print(f"   {row.get('skill_name', '')} -> {row.get('live_skill_path', '')}")
             rp = os.path.join(latest, "report.md")
             if os.path.exists(rp):
                 with open(rp) as f:
@@ -445,6 +467,40 @@ def cmd_adopt(args) -> int:
     if not target or not os.path.isdir(target):
         print("[sleep] nothing to adopt (no staging dir).")
         return 1
+    selected = list(getattr(args, "skills", None) or [])
+    adopt_all = bool(getattr(args, "all_skills", False))
+    if selected and adopt_all:
+        print("[sleep] use --skill or --all-skills, not both.")
+        return 2
+    try:
+        rows = staged_skills(target)
+    except Exception as exc:
+        print(f"[sleep] cannot read staged skills: {exc}")
+        return 1
+    if selected or adopt_all:
+        if not rows:
+            print("[sleep] this night has no per-skill proposals; omit --skill to adopt the legacy pair.")
+            return 2
+        names = None if adopt_all else selected
+        try:
+            receipts = adopt_skills(target, names)
+        except StagingError as exc:
+            print(f"[sleep] adopt refused: {exc}")
+            return 2
+        except OSError as exc:
+            print(f"[sleep] adopt failed: {exc}")
+            return 1
+        print(f"[sleep] adopted from {target}")
+        for receipt in receipts:
+            print(f"   -> {receipt.skill_name}: {receipt.live_skill_path}")
+        if not receipts:
+            print("[sleep] (no skills in the selection)")
+        return 0
+    if rows:
+        print("[sleep] this night staged per-skill proposals; pass --skill NAME or --all-skills.")
+        for row in rows:
+            print(f"   {row.get('skill_name', '')} -> {row.get('live_skill_path', '')}")
+        return 2
     updated = adopt_staging(target)
     print(f"[sleep] adopted from {target}")
     for p in updated:
@@ -535,6 +591,14 @@ def main(argv=None) -> int:
     p_adopt = sub.add_parser("adopt", help="apply latest staged proposal")
     _add_common(p_adopt)
     p_adopt.add_argument("--staging", default="", help="specific staging dir")
+    p_adopt.add_argument(
+        "--skill", action="append", default=[], dest="skills",
+        help="adopt this staged skill (repeatable)",
+    )
+    p_adopt.add_argument(
+        "--all-skills", action="store_true", dest="all_skills",
+        help="adopt every staged per-skill proposal",
+    )
     p_harvest = sub.add_parser("harvest", help="debug: show mined tasks")
     _add_common(p_harvest)
     p_harvest.add_argument("--output", default="", help="write mined tasks JSON for review")
