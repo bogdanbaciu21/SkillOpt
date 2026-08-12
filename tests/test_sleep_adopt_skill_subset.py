@@ -204,28 +204,56 @@ class TestAdoptSkillSubset(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(os.stat(night.alpha_live).st_mode), 0o640)
 
     def test_a_failed_write_rolls_the_whole_selection_back(self):
+        from skillopt_sleep import staging as staging_mod
+
         with tempfile.TemporaryDirectory() as tmp:
             night = TwoSkillNight(tmp)
-            # beta's live path becomes un-writable: its parent is now a file.
-            os.unlink(night.beta_live)
-            os.rmdir(os.path.dirname(night.beta_live))
-            _write(os.path.dirname(night.beta_live), "not a directory\n")
-            with self.assertRaises(OSError):
-                adopt_skills(night.staging)
+            real_write = staging_mod._write_atomic
+
+            def boom(path, text, *, create_parents=True):
+                if path == night.beta_live:
+                    raise OSError("disk full")
+                return real_write(path, text, create_parents=create_parents)
+
+            with mock.patch.object(staging_mod, "_write_atomic", side_effect=boom):
+                with self.assertRaises(OSError):
+                    adopt_skills(night.staging)
             self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+            self.assertEqual(_read(night.beta_live), "# beta v1\n")
             self.assertFalse(
                 os.path.exists(os.path.join(night.staging, "adopted_skills.json")))
 
     def test_rollback_removes_files_that_did_not_exist_before(self):
+        from skillopt_sleep import staging as staging_mod
+
         with tempfile.TemporaryDirectory() as tmp:
             night = TwoSkillNight(tmp)
             os.unlink(night.alpha_live)
             os.unlink(night.beta_live)
+            real_write = staging_mod._write_atomic
+
+            def boom(path, text, *, create_parents=True):
+                if path == night.beta_live:
+                    raise OSError("disk full")
+                return real_write(path, text, create_parents=create_parents)
+
+            with mock.patch.object(staging_mod, "_write_atomic", side_effect=boom):
+                with self.assertRaises(OSError):
+                    adopt_skills(night.staging)
+            self.assertFalse(os.path.exists(night.alpha_live))
+            self.assertFalse(os.path.exists(night.beta_live))
+
+    def test_missing_live_parent_is_refused_before_any_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            os.unlink(night.beta_live)
             os.rmdir(os.path.dirname(night.beta_live))
             _write(os.path.dirname(night.beta_live), "not a directory\n")
-            with self.assertRaises(OSError):
+            with self.assertRaises(StagingError):
                 adopt_skills(night.staging)
-            self.assertFalse(os.path.exists(night.alpha_live))
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+            self.assertFalse(
+                os.path.exists(os.path.join(night.staging, "adopted_skills.json")))
 
     def test_adoption_never_happens_without_an_explicit_call(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -458,6 +486,33 @@ class TestAdoptSkillCli(unittest.TestCase):
             self.assertIn("no per-skill", out)
             self.assertEqual(_read(live), "# live v1\n")
 
+    def test_empty_skill_flag_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            TwoSkillNight(tmp)
+            claude_home = os.path.join(tmp, ".claude")
+            os.makedirs(claude_home, exist_ok=True)
+            rc, out = self._cli([
+                "adopt", "--project", tmp, "--claude-home", claude_home,
+                "--skill", "   ",
+            ])
+            self.assertEqual(rc, 2)
+            self.assertIn("non-empty", out)
+            self.assertEqual(_read(os.path.join(tmp, "live", "alpha", "SKILL.md")),
+                             "# alpha v1\n")
+
+    def test_skill_flag_strips_surrounding_whitespace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            claude_home = os.path.join(tmp, ".claude")
+            os.makedirs(claude_home, exist_ok=True)
+            rc, out = self._cli([
+                "adopt", "--project", tmp, "--claude-home", claude_home,
+                "--skill", "  alpha  ",
+            ])
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(_read(night.alpha_live), "# alpha v2\n")
+            self.assertEqual(_read(night.beta_live), "# beta v1\n")
+
 
 class TestAdoptTimeRevalidationMega(unittest.TestCase):
     def test_casefold_live_path_collision_is_refused_at_adopt(self):
@@ -506,10 +561,10 @@ class TestAdoptTimeRevalidationMega(unittest.TestCase):
             previous = _read(receipt_path)
             real_write = staging_mod._write_atomic
 
-            def boom(path, text):
+            def boom(path, text, *, create_parents=True):
                 if os.path.basename(path) == "adopted_skills.json":
                     raise OSError("disk full")
-                return real_write(path, text)
+                return real_write(path, text, create_parents=create_parents)
 
             with mock.patch.object(staging_mod, "_write_atomic", side_effect=boom):
                 with self.assertRaises(OSError):
@@ -548,7 +603,7 @@ class TestSkillProposalsFromGroups(unittest.TestCase):
                 claude_home=claude_home,
                 managed_skill_name="skillopt-sleep-learned",
             )
-            proposals = _skill_proposals_from_groups(
+            proposals, notes = _skill_proposals_from_groups(
                 cfg,
                 {
                     "skillopt-sleep-learned": _accepted_group(
@@ -564,6 +619,8 @@ class TestSkillProposalsFromGroups(unittest.TestCase):
             self.assertEqual(names, ["research-skill"])
             self.assertEqual(proposals[0].live_skill_path, os.path.realpath(live))
             self.assertEqual(proposals[0].proposed_skill, "# research v2\n")
+            self.assertTrue(any("ghost-skill" in note for note in notes))
+            self.assertFalse(any("skillopt-sleep-learned" in note for note in notes))
 
     def test_skips_a_second_skill_that_resolves_to_the_same_live_file(self):
         from skillopt_sleep.config import load_config
@@ -580,7 +637,7 @@ class TestSkillProposalsFromGroups(unittest.TestCase):
             except OSError:
                 self.skipTest("symlinks unavailable")
             cfg = load_config(claude_home=claude_home)
-            proposals = _skill_proposals_from_groups(
+            proposals, notes = _skill_proposals_from_groups(
                 cfg,
                 {
                     "research-skill": _accepted_group(
@@ -591,6 +648,7 @@ class TestSkillProposalsFromGroups(unittest.TestCase):
                 "skillopt-sleep-learned",
             )
             self.assertEqual([p.skill_name for p in proposals], ["research-skill"])
+            self.assertTrue(any("alias-skill" in note for note in notes))
 
 
 class TestCycleStagingGaps(unittest.TestCase):
@@ -627,6 +685,9 @@ class TestCycleStagingGaps(unittest.TestCase):
             self.assertEqual(names, ["research-skill"])
             self.assertFalse(os.path.isfile(os.path.join(
                 outcome.staging_dir, "proposed_SKILL.programming-skill.md")))
+            self.assertTrue(any(
+                "programming-skill" in note for note in outcome.report.notes
+            ))
 
     def test_report_off_stages_no_per_skill_proposals(self):
         from skillopt_sleep.config import load_config
@@ -671,6 +732,140 @@ class TestCycleStagingGaps(unittest.TestCase):
             names = [r["skill_name"] for r in staged_skills(outcome.staging_dir)]
             self.assertIn("research-skill", names)
             self.assertIn("programming-skill", names)
+
+
+class TestAdoptHardeningPinsAndLayout(unittest.TestCase):
+    def test_tampered_proposal_file_is_refused_by_sha256_pin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            staged = os.path.join(night.staging, "proposed_SKILL.alpha.md")
+            _write(staged, "# alpha tampered\n")
+            with self.assertRaisesRegex(StagingError, "does not match its manifest sha256"):
+                adopt_skills(night.staging, ["alpha"])
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+            self.assertFalse(
+                os.path.exists(os.path.join(night.staging, "adopted_skills.json")))
+
+    def test_missing_sha256_pin_is_refused_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            manifest_path = os.path.join(night.staging, "manifest.json")
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            del manifest["skills"][0]["sha256"]
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            with self.assertRaisesRegex(StagingError, "missing a sha256 pin"):
+                adopt_skills(night.staging, ["alpha"])
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+
+    def test_empty_staged_proposal_is_refused_even_when_hash_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            staged = os.path.join(night.staging, "proposed_SKILL.alpha.md")
+            _write(staged, "   \n")
+            manifest_path = os.path.join(night.staging, "manifest.json")
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            manifest["skills"][0]["sha256"] = _sha("   \n")
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            with self.assertRaisesRegex(StagingError, "is empty"):
+                adopt_skills(night.staging, ["alpha"])
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+
+    def test_symlink_live_file_is_refused_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            os.unlink(night.alpha_live)
+            elsewhere = os.path.join(tmp, "elsewhere.md")
+            _write(elsewhere, "# elsewhere\n")
+            try:
+                os.symlink(elsewhere, night.alpha_live)
+            except OSError:
+                self.skipTest("symlinks unavailable")
+            with self.assertRaisesRegex(StagingError, "is a symlink"):
+                adopt_skills(night.staging, ["alpha"])
+            self.assertEqual(_read(elsewhere), "# elsewhere\n")
+            self.assertTrue(os.path.islink(night.alpha_live))
+
+    def test_symlink_parent_directory_is_refused_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            real_parent = os.path.dirname(night.alpha_live)
+            alias_parent = os.path.join(night.live_root, "alias-alpha")
+            try:
+                os.symlink(real_parent, alias_parent)
+            except OSError:
+                self.skipTest("symlinks unavailable")
+            alias_live = os.path.join(alias_parent, "SKILL.md")
+            manifest_path = os.path.join(night.staging, "manifest.json")
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            manifest["skills"][0]["skill_name"] = "alias-alpha"
+            manifest["skills"][0]["proposed_file"] = "proposed_SKILL.alias-alpha.md"
+            manifest["skills"][0]["live_skill_path"] = alias_live
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            os.rename(
+                os.path.join(night.staging, "proposed_SKILL.alpha.md"),
+                os.path.join(night.staging, "proposed_SKILL.alias-alpha.md"),
+            )
+            with self.assertRaisesRegex(StagingError, "is a symlink"):
+                adopt_skills(night.staging, ["alias-alpha"])
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+
+    def test_subset_adopt_refuses_unselected_sibling_realpath_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            alias = os.path.join(night.live_root, "alias", "SKILL.md")
+            os.makedirs(os.path.dirname(alias), exist_ok=True)
+            try:
+                os.symlink(night.alpha_live, alias)
+            except OSError:
+                self.skipTest("symlinks unavailable")
+            manifest_path = os.path.join(night.staging, "manifest.json")
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            manifest["skills"][1]["live_skill_path"] = alias
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            with self.assertRaises(StagingError):
+                adopt_skills(night.staging, ["alpha"])
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+            self.assertEqual(_read(night.beta_live), "# beta v1\n")
+
+    def test_live_path_not_named_skill_md_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            night = TwoSkillNight(tmp)
+            wrong = os.path.join(night.live_root, "alpha", "NOTES.md")
+            _write(wrong, "# notes\n")
+            manifest_path = os.path.join(night.staging, "manifest.json")
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            manifest["skills"][0]["live_skill_path"] = wrong
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            with self.assertRaisesRegex(StagingError, "must be a SKILL.md file"):
+                adopt_skills(night.staging, ["alpha"])
+            self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
+
+    def test_cycle_skips_empty_proposed_skill_with_a_note(self):
+        from skillopt_sleep.config import load_config
+        from skillopt_sleep.cycle import _skill_proposals_from_groups
+
+        with tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            live = os.path.join(claude_home, "skills", "research-skill", "SKILL.md")
+            _write(live, "# research v1\n")
+            cfg = load_config(claude_home=claude_home)
+            proposals, notes = _skill_proposals_from_groups(
+                cfg,
+                {"research-skill": _accepted_group("research-skill", "   \n")},
+                "skillopt-sleep-learned",
+            )
+            self.assertEqual(proposals, [])
+            self.assertTrue(any("empty proposed_skill" in note for note in notes))
 
 
 if __name__ == "__main__":

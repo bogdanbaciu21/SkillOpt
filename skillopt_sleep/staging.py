@@ -308,10 +308,15 @@ def proposal_filename(skill_name: str) -> str:
     return f"proposed_SKILL.{skill_name}.md"
 
 
-def _write_atomic(path: str, text: str) -> None:
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _write_atomic(path: str, text: str, *, create_parents: bool = True) -> None:
     """Write ``text`` to ``path`` atomically, so review never sees half a file."""
     directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
+    if create_parents:
+        os.makedirs(directory, exist_ok=True)
     existing_mode = (
         stat.S_IMODE(os.stat(path).st_mode) if os.path.exists(path) else None
     )
@@ -390,6 +395,7 @@ def skill_proposal_rows(proposals: Iterable[SkillProposal]) -> List[Dict[str, An
             "skill_name": name,
             "proposed_file": proposed_file,
             "live_skill_path": live,
+            "sha256": _sha256_text(proposal.proposed_skill),
         })
     return rows
 
@@ -410,6 +416,11 @@ def write_skill_proposals(
     rows = skill_proposal_rows(proposals)
     if not rows:
         return rows
+    for row, proposal in zip(rows, proposals):
+        if not str(proposal.proposed_skill).strip():
+            raise StagingError(
+                f"proposed skill content for {row['skill_name']!r} is empty"
+            )
     os.makedirs(out_dir, exist_ok=True)
     for row, proposal in zip(rows, proposals):
         _write_atomic(os.path.join(out_dir, row["proposed_file"]), proposal.proposed_skill)
@@ -513,10 +524,6 @@ class AdoptedSkill:
     backup_path: str = ""       # "" when there was nothing to back up
 
 
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 def staged_skills(staging_dir: str) -> List[Dict[str, Any]]:
     """Manifest rows for the per-skill proposals staged in ``staging_dir``."""
     with open(os.path.join(staging_dir, "manifest.json"), encoding="utf-8") as f:
@@ -553,26 +560,33 @@ def _selected_rows(
     return [row for row in rows if str(row.get("skill_name", "")) in chosen]
 
 
-def _revalidate_selected_skill_rows(rows: Sequence[Dict[str, Any]]) -> None:
+def _revalidate_selected_skill_rows(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    all_rows: Optional[Sequence[Dict[str, Any]]] = None,
+) -> None:
     """Re-run uniqueness and live-target checks at adoption time.
 
     Staging already refused collisions, but the manifest can be edited between
     staging and adopt. A tampered pair that shares a skill name, a staged
-    filename, or a live target must fail here with no writes. Live paths are
+    filename, or a live target must fail here with no writes. The check runs
+    against every staged row, not only the selection, so adopting one skill
+    cannot hide a sibling that now points at the same file. Live paths are
     also compared by realpath so a symlink cannot hide a second claim on one
     file, and a live path that exists as something other than a file is
     refused rather than overwritten.
     """
+    universe = list(all_rows) if all_rows is not None else list(rows)
     skill_proposal_rows([
         SkillProposal(
             str(row.get("skill_name") or ""),
             "",
             str(row.get("live_skill_path") or ""),
         )
-        for row in rows
+        for row in universe
     ])
     seen_real: Dict[str, str] = {}
-    for row in rows:
+    for row in universe:
         name = _safe_skill_name(row.get("skill_name"))
         live = _safe_live_path(row.get("live_skill_path"))
         if not name or not live:
@@ -593,6 +607,35 @@ def _revalidate_selected_skill_rows(rows: Sequence[Dict[str, Any]]) -> None:
             )
 
 
+def _valid_sha256_pin(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(ch in "0123456789abcdef" for ch in value)
+
+
+def _adopt_live_target_ok(name: str, live: str) -> None:
+    """Refuse live targets that would create dirs, follow links, or leave the skill folder."""
+    if os.path.islink(live):
+        raise StagingError(f"live skill path for {name!r} is a symlink: {live}")
+    parent = os.path.dirname(live)
+    if os.path.islink(parent):
+        raise StagingError(
+            f"live skill parent directory for {name!r} is a symlink: {parent}"
+        )
+    if not os.path.isdir(parent):
+        raise StagingError(
+            f"live skill parent directory for {name!r} does not exist: {parent}"
+        )
+    if os.path.basename(live) != "SKILL.md":
+        raise StagingError(
+            f"live skill path for {name!r} must be a SKILL.md file: {live}"
+        )
+    if os.path.basename(parent) != name:
+        raise StagingError(
+            f"live skill path for {name!r} is not {name}/SKILL.md: {live}"
+        )
+
+
 def _restore_live_writes(done: Sequence[tuple]) -> None:
     """Restore live files written by a failed adoption, newest first."""
     for live, original in reversed(done):
@@ -602,6 +645,26 @@ def _restore_live_writes(done: Sequence[tuple]) -> None:
         else:
             with open(live, "wb") as f:
                 f.write(original)
+
+
+def _restore_receipt_bytes(path: str, original: Optional[bytes]) -> None:
+    """Put ``adopted_skills.json`` back without leaving a half-written file."""
+    if original is not None:
+        directory = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(original)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+        return
+    if os.path.isfile(path):
+        os.unlink(path)
 
 
 def adopt_skills(
@@ -614,16 +677,18 @@ def adopt_skills(
     are never touched.
 
     Every selected proposal is validated first, including a second uniqueness
-    and live-target check against the current manifest and filesystem. Each
-    live file is backed up, and the writes — including ``adopted_skills.json``
-    — are rolled back as a set if any one of them fails, so a partial adoption
-    never survives. Returns a before/after sha256 receipt per skill and also
-    writes them to ``adopted_skills.json`` in the staging directory.
+    and live-target check against the **whole** current manifest, a sha256 pin
+    of the staged file, and a live-path layout check. Each live file is backed
+    up, and the writes — including ``adopted_skills.json`` — are rolled back as
+    a set if any one of them fails, so a partial adoption never survives.
+    Returns a before/after sha256 receipt per skill and also writes them to
+    ``adopted_skills.json`` in the staging directory.
     """
-    rows = _selected_rows(staged_skills(staging_dir), skill_names)
+    all_rows = staged_skills(staging_dir)
+    rows = _selected_rows(all_rows, skill_names)
     if not rows:
         return []
-    _revalidate_selected_skill_rows(rows)
+    _revalidate_selected_skill_rows(rows, all_rows=all_rows)
 
     plan: List[tuple] = []
     for row in rows:
@@ -635,6 +700,7 @@ def adopt_skills(
             raise StagingError(
                 f"unsafe live skill path for {name!r}: {row.get('live_skill_path')!r}"
             )
+        _adopt_live_target_ok(name, live)
         proposed_file = row.get("proposed_file")
         expected_file = proposal_filename(name)
         if proposed_file != expected_file:
@@ -645,7 +711,18 @@ def adopt_skills(
         staged = os.path.join(staging_dir, expected_file)
         if not os.path.isfile(staged):
             raise StagingError(f"staged proposal missing for {name!r}: {staged}")
-        plan.append((name, live, staged))
+        with open(staged, encoding="utf-8") as f:
+            proposed = f.read()
+        pin = row.get("sha256")
+        if not _valid_sha256_pin(pin):
+            raise StagingError(f"staged proposal for {name!r} is missing a sha256 pin")
+        if _sha256_text(proposed) != pin:
+            raise StagingError(
+                f"staged proposal for {name!r} does not match its manifest sha256"
+            )
+        if not proposed.strip():
+            raise StagingError(f"staged proposal for {name!r} is empty")
+        plan.append((name, live, proposed))
 
     backup_dir = os.path.join(staging_dir, "backup", "skills")
     receipts: List[AdoptedSkill] = []
@@ -656,9 +733,7 @@ def adopt_skills(
         with open(receipt_path, "rb") as f:
             receipt_original = f.read()
     try:
-        for name, live, staged in plan:
-            with open(staged, encoding="utf-8") as f:
-                proposed = f.read()
+        for name, live, proposed in plan:
             original = None
             backup_path = ""
             if os.path.exists(live):
@@ -669,7 +744,7 @@ def adopt_skills(
                 backup_path = os.path.join(skill_backup, os.path.basename(live))
                 shutil.copy2(live, backup_path)
             before = hashlib.sha256(original).hexdigest() if original is not None else ""
-            _write_atomic(live, proposed)
+            _write_atomic(live, proposed, create_parents=False)
             done.append((live, original))
             receipts.append(AdoptedSkill(
                 skill_name=name, live_skill_path=live, sha256_before=before,
@@ -681,11 +756,7 @@ def adopt_skills(
         )
     except BaseException:
         _restore_live_writes(done)
-        if receipt_original is not None:
-            with open(receipt_path, "wb") as f:
-                f.write(receipt_original)
-        elif os.path.isfile(receipt_path):
-            os.unlink(receipt_path)
+        _restore_receipt_bytes(receipt_path, receipt_original)
         raise
     return receipts
 

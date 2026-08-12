@@ -275,34 +275,48 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
     return "\n".join(lines)
 
 
+def _cycle_skip_note(name: str, reason: str) -> str:
+    """One-line skip reason for report.notes. Names are untrusted free text."""
+    label = str(name or "").strip() or "<unnamed>"
+    return redact_secrets(f"cycle skipped skill {label}: {reason}")
+
+
 def _skill_proposals_from_groups(
     cfg: SleepConfig,
     group_outcomes: dict,
     managed_name: str,
-) -> List[SkillProposal]:
+) -> tuple[List[SkillProposal], List[str]]:
     """Stage per-skill proposals for accepted groups whose names resolve uniquely.
 
     Groups still consolidate from the managed document; this only chooses the
     live ``SKILL.md`` each accepted name would replace. Unresolved, ambiguous,
-    rejected, or colliding names are skipped so one bad hint cannot abort the
-    night. The managed catch-all is never staged here — it stays on the legacy
-    ``proposed_SKILL.md`` path.
+    rejected, empty, or colliding names are skipped so one bad hint cannot abort
+    the night; each skip is recorded on ``report.notes``. The managed catch-all
+    is never staged here — it stays on the legacy ``proposed_SKILL.md`` path.
     """
     roots = skill_search_roots(cfg)
     proposals: List[SkillProposal] = []
+    notes: List[str] = []
     for name, new_skill in accepted_group_skills(group_outcomes).items():
         if name == managed_name:
             continue
+        if not str(new_skill or "").strip():
+            notes.append(_cycle_skip_note(name, "empty proposed_skill"))
+            continue
         resolution = resolve_skill(name, roots)
         if not resolution.ok:
+            notes.append(
+                _cycle_skip_note(name, resolution.reason or resolution.status)
+            )
             continue
         candidate = SkillProposal(name, new_skill, resolution.path)
         try:
             skill_proposal_rows(proposals + [candidate])
-        except StagingError:
+        except StagingError as exc:
+            notes.append(_cycle_skip_note(name, str(exc)))
             continue
         proposals.append(candidate)
-    return proposals
+    return proposals, notes
 
 
 def run_sleep_cycle(
@@ -606,7 +620,10 @@ def run_sleep_cycle(
         report_md = _render_report_md(report, cfg)
         proposed_skill = result.new_skill if (cfg.get("evolve_skill") and result.accepted) else None
         proposed_memory = result.new_memory if (cfg.get("evolve_memory") and result.accepted) else None
-        skill_proposals = _skill_proposals_from_groups(cfg, group_outcomes, managed_name)
+        skill_proposals, skip_notes = _skill_proposals_from_groups(
+            cfg, group_outcomes, managed_name
+        )
+        report.notes.extend(skip_notes)
         staging_dir = write_staging(
             project,
             report=report,

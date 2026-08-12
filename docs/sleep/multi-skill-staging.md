@@ -26,8 +26,8 @@ When `multi_skill_report` is on and hinted groups pass the gate:
 - each accepted group name is resolved with `resolve_skill` against
   `skill_search_roots(cfg)`;
 - only `FOUND` unique live paths become `SkillProposal` rows;
-- missing, ambiguous, rejected, or colliding names are skipped rather than
-  aborting the night.
+- missing, ambiguous, rejected, empty, or colliding names are skipped rather
+  than aborting the night, and each skip is recorded on `report.notes`.
 
 Review remains explicit. `auto_adopt` still only runs the legacy `adopt()`
 pair; it never silently promotes every staged skill.
@@ -65,12 +65,14 @@ Multi-skill night — one extra file and one manifest row per skill:
     {
       "skill_name": "alpha",
       "proposed_file": "proposed_SKILL.alpha.md",
-      "live_skill_path": "/home/dev/.claude/skills/alpha/SKILL.md"
+      "live_skill_path": "/home/dev/.claude/skills/alpha/SKILL.md",
+      "sha256": "<sha256 of proposed_SKILL.alpha.md>"
     },
     {
       "skill_name": "beta",
       "proposed_file": "proposed_SKILL.beta.md",
-      "live_skill_path": "/home/dev/.claude/skills/beta/SKILL.md"
+      "live_skill_path": "/home/dev/.claude/skills/beta/SKILL.md",
+      "sha256": "<sha256 of proposed_SKILL.beta.md>"
     }
   ]
 }
@@ -108,17 +110,23 @@ skill. It lists the names and asks for `--skill` or `--all-skills`. Legacy
 nights (no `skills` in the manifest) still use `adopt()` unchanged.
 
 - `skill_names=None` adopts every staged skill; `[]` adopts nothing.
-- An unknown or repeated name, an unsafe manifest row, a missing proposal file,
-  or a uniqueness / live-target collision raises `StagingError` **before**
-  anything is written.
-- Uniqueness and live-target nonexistence are re-checked **at adoption time**,
-  not only at staging, so a tampered manifest that points two skills at one
-  file (including via casefold or realpath/symlink) is refused with no writes.
+- An unknown or repeated name, an empty `--skill` token, an unsafe manifest
+  row, a missing proposal file, a sha256 mismatch, an empty proposal body, or a
+  uniqueness / live-target collision raises `StagingError` **before** anything
+  is written.
+- Uniqueness and live-target checks run **at adoption time against every staged
+  row**, not only the selection, so adopting one skill cannot hide a sibling
+  that now points at the same file (including via casefold or realpath/symlink).
   A live path that exists as something other than a file is also refused.
+- Each selected proposal is pinned by the manifest `sha256`. Tampering with the
+  staged file, or dropping the pin, is refused with no writes.
+- The live target must already be `<skill_name>/SKILL.md`. Adopt will not create
+  parent directories, follow a symlink file, or write through a symlink parent.
 - Each live file is backed up to `backup/skills/<skill>/` and written atomically.
 - If any write fails — including `adopted_skills.json` — every live file in the
-  selection is restored (and files that did not exist before are removed), so a
-  partial adoption never survives.
+  selection is restored (and files that did not exist before are removed), and
+  the previous receipt bytes are restored atomically, so a partial adoption
+  never survives.
 - Receipts (`skill_name`, `live_skill_path`, `sha256_before`, `sha256_after`,
   `backup_path`) are returned and written to `adopted_skills.json` in the staging
   directory. An empty `sha256_before` means the skill had no live file yet.

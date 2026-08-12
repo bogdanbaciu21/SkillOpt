@@ -5,6 +5,7 @@ Run:  python -m pytest tests/test_sleep_staging_fanout.py
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -40,6 +41,10 @@ class TestSkillProposalRows(unittest.TestCase):
                          ["proposed_SKILL.alpha.md", "proposed_SKILL.beta.md"])
         self.assertEqual(rows[0]["live_skill_path"],
                          os.path.normpath("/tmp/live/alpha/SKILL.md"))
+        self.assertEqual(
+            rows[0]["sha256"],
+            hashlib.sha256(b"# example\n").hexdigest(),
+        )
 
     def test_filenames_are_unique_per_skill(self):
         self.assertNotEqual(proposal_filename("alpha"), proposal_filename("beta"))
@@ -147,6 +152,12 @@ class TestWriteSkillProposals(unittest.TestCase):
             with open(os.path.join(tmp, rows[0]["proposed_file"]), encoding="utf-8") as f:
                 self.assertEqual(f.read(), "# alpha\n")
 
+    def test_empty_proposal_body_is_refused_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(StagingError, "is empty"):
+                write_skill_proposals(tmp, [_proposal("alpha", "   \n")])
+            self.assertEqual(os.listdir(tmp), [])
+
     def test_no_proposals_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(write_skill_proposals(tmp, []), [])
@@ -227,6 +238,10 @@ class TestWriteStagingCompatibility(unittest.TestCase):
             self.assertEqual([r["skill_name"] for r in rows], ["alpha", "beta"])
             self.assertEqual(rows[1]["live_skill_path"],
                              os.path.join(live_root, "beta", "SKILL.md"))
+            self.assertEqual(
+                rows[0]["sha256"],
+                hashlib.sha256(b"# alpha\n").hexdigest(),
+            )
 
     def test_unsafe_fan_out_writes_no_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:

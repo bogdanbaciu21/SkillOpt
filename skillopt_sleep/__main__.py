@@ -467,7 +467,11 @@ def cmd_adopt(args) -> int:
     if not target or not os.path.isdir(target):
         print("[sleep] nothing to adopt (no staging dir).")
         return 1
-    selected = list(getattr(args, "skills", None) or [])
+    raw_selected = list(getattr(args, "skills", None) or [])
+    if any(not str(name).strip() for name in raw_selected):
+        print("[sleep] --skill names must be non-empty.")
+        return 2
+    selected = [str(name).strip() for name in raw_selected]
     adopt_all = bool(getattr(args, "all_skills", False))
     if selected and adopt_all:
         print("[sleep] use --skill or --all-skills, not both.")
