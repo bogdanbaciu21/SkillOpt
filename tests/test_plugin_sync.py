@@ -112,11 +112,13 @@ class TestPluginParity(unittest.TestCase):
         self.assertIn('claude_path="claude"', text)
         self.assertIn('pi_path=""', text)
         self.assertIn('cursor_path=""', text)
+        self.assertIn('opencode_path=""', text)
         self.assertIn('azure_endpoint=""', text)
         self.assertIn('project_dir=""', text)
         self.assertIn("claude_path=claude_path", text)
         self.assertIn("pi_path=pi_path", text)
         self.assertIn("cursor_path=cursor_path", text)
+        self.assertIn("opencode_path=opencode_path", text)
         self.assertIn("azure_endpoint=azure_endpoint", text)
         self.assertIn("project_dir=project_dir", text)
         self.assertNotIn("**kwargs", text)
@@ -130,6 +132,7 @@ from skillopt_sleep.backend import build_backend
 backend = build_backend(
     backend="mock",
     pi_path="unused-pi",
+    opencode_path="unused-opencode",
     azure_endpoint="https://unused.invalid",
 )
 assert backend.name == "mock", backend.name

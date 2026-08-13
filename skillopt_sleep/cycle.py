@@ -9,6 +9,7 @@ CI use. With backend="anthropic" it spends the user's budget for real lift.
 """
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import sys
@@ -30,7 +31,14 @@ from skillopt_sleep.multi_skill import (
     skill_group_reports,
 )
 from skillopt_sleep.skill_resolver import resolve_skill, skill_search_roots
-from skillopt_sleep.staging import SkillProposal, StagingError, redact_secrets, skill_proposal_rows, write_staging
+from skillopt_sleep.staging import (
+    SkillProposal,
+    StagingError,
+    json_safe,
+    redact_secrets,
+    skill_proposal_rows,
+    write_staging,
+)
 from skillopt_sleep.staging import adopt as adopt_staging
 from skillopt_sleep.state import SleepState, _now_iso
 from skillopt_sleep.types import SessionDigest, SleepReport, TaskRecord
@@ -56,6 +64,7 @@ def _make_model_key(cfg: SleepConfig) -> str:
             codex_path=cfg.get("codex_path", ""),
             pi_path=cfg.get("pi_path", ""),
             cursor_path=cfg.get("cursor_path", ""),
+            opencode_path=cfg.get("opencode_path", ""),
             azure_endpoint=cfg.get("azure_endpoint", ""),
             project_dir=cfg.get("invoked_project", "") or os.getcwd(),
         )
@@ -178,6 +187,17 @@ def _markdown_table_text(value: object) -> str:
     )
 
 
+def _report_score(value: object) -> str:
+    """Render an optional numeric score without breaking the report."""
+    if value is None:
+        return "—"
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{score:.3f}" if math.isfinite(score) else "—"
+
+
 def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
     lines = [
         f"# SkillOpt-Sleep — night {report.night} report",
@@ -186,8 +206,11 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
         f"- backend: `{cfg.get('backend')}`  replay: `{cfg.get('replay_mode')}`",
         f"- sessions harvested: {report.n_sessions}",
         f"- tasks mined: {report.n_tasks}  (replayed: {report.n_replayed})",
-        f"- held-out score: {report.baseline_score:.3f} -> {report.candidate_score:.3f}",
+        f"- held-out score: {_report_score(report.baseline_score)} "
+        f"-> {_report_score(report.candidate_score)}",
         f"- gate: **{report.gate_action}** (accepted={report.accepted})",
+        f"- no-regression gate: "
+        f"{'enabled' if cfg.get('gate_no_regression', False) else 'disabled'}",
         f"- tokens used: {report.tokens_used}",
         "",
     ]
@@ -204,6 +227,42 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
             "suggestions, not rejections.",
             "",
         ]
+    if report.gate_trials:
+        lines.append("## Held-out task changes")
+        lines.append(
+            "_These are observed score changes under the configured gate metric; "
+            "they do not establish that a particular edit caused the change._"
+        )
+        lines.append("")
+        for trial in report.gate_trials:
+            target = _markdown_table_text(trial.get("target", "candidate"))
+            accepted = bool(trial.get("accepted", False))
+            blocked = bool(trial.get("blocked_by_regression", False))
+            decision = "accepted" if accepted else "rejected"
+            if blocked:
+                decision += " (task regression)"
+            baseline = _report_score(trial.get("baseline_score"))
+            candidate = _report_score(trial.get("candidate_score"))
+            lines.append(
+                f"### `{target}` candidate — {decision} "
+                f"({baseline} → {candidate})"
+            )
+            lines.append("")
+            lines.append("| Task | Tags | Baseline | Candidate | Change |")
+            lines.append("|---|---|---:|---:|---|")
+            for delta in trial.get("task_deltas", []):
+                task_id = _markdown_table_text(delta.get("task_id", ""))
+                tags = _markdown_table_text(
+                    ", ".join(str(tag) for tag in delta.get("tags", [])) or "—"
+                )
+                baseline_score = _report_score(delta.get("baseline_score"))
+                candidate_score = _report_score(delta.get("candidate_score"))
+                status = _markdown_table_text(delta.get("status", "unchanged"))
+                lines.append(
+                    f"| `{task_id}` | {tags} | {baseline_score} "
+                    f"| {candidate_score} | {status} |"
+                )
+            lines.append("")
     if report.edits:
         lines.append("## Accepted edits")
         for e in report.edits:
@@ -353,6 +412,7 @@ def run_sleep_cycle(
         codex_path=cfg.get("codex_path", ""),
         pi_path=cfg.get("pi_path", ""),
         cursor_path=cfg.get("cursor_path", ""),
+        opencode_path=cfg.get("opencode_path", ""),
         azure_endpoint=cfg.get("azure_endpoint", ""),
         preferences=cfg.get("preferences", ""),
         project_dir=project,
@@ -390,7 +450,8 @@ def run_sleep_cycle(
                config={k: cfg.get(k) for k in (
                    "backend", "model", "optimizer_backend", "optimizer_model",
                    "target_backend", "target_model", "gate_mode", "gate_metric",
-                   "gate_mixed_weight", "edit_budget", "holdout_fraction",
+                   "gate_mixed_weight", "gate_no_regression", "edit_budget",
+                   "holdout_fraction",
                    "dream_rollouts", "dream_factor", "recall_k",
                    "max_tasks_per_night", "lookback_hours", "llm_mine",
                    "evolve_skill", "evolve_memory")})
@@ -506,6 +567,7 @@ def run_sleep_cycle(
     report = SleepReport(
         night=night, project=project, started_at=started,
         n_sessions=n_sessions, n_tasks=len(tasks),
+        gate_no_regression=bool(cfg.get("gate_no_regression", False)),
     )
 
     if not tasks:
@@ -541,6 +603,7 @@ def run_sleep_cycle(
             edit_budget=cfg.get("edit_budget", 4),
             gate_metric=cfg.get("gate_metric", "mixed"),
             gate_mixed_weight=cfg.get("gate_mixed_weight", 0.5),
+            gate_no_regression=cfg.get("gate_no_regression", False),
             gate_mode=cfg.get("gate_mode", "on"),
             evolve_skill=cfg.get("evolve_skill", True),
             evolve_memory=cfg.get("evolve_memory", True),
@@ -568,6 +631,7 @@ def run_sleep_cycle(
     report.edits = result.applied_edits
     report.rejected_edits = result.rejected_edits
     report.unmatched_edits = result.unmatched_edits
+    report.gate_trials = redact_secrets(getattr(result, "gate_trials", []))
 
     # ── 4b. optional per-skill group reporting ───────────────────────────
     # Off by default. When enabled, tonight's tasks are grouped by their skill
@@ -595,6 +659,7 @@ def run_sleep_cycle(
                 edit_budget=cfg.get("edit_budget", 4),
                 gate_metric=cfg.get("gate_metric", "mixed"),
                 gate_mixed_weight=cfg.get("gate_mixed_weight", 0.5),
+                gate_no_regression=cfg.get("gate_no_regression", False),
                 gate_mode=cfg.get("gate_mode", "on"),
                 night=night,
             )
@@ -649,25 +714,34 @@ def run_sleep_cycle(
             # credentials (e.g. a codex 401 stderr dump), so scrub secret-looking
             # substrings before persisting them to the on-disk diagnostics.
             with open(os.path.join(staging_dir, "diagnostics.json"), "w", encoding="utf-8") as _fh:
-                _json.dump({
-                    "night": night,
-                    "backend": cfg.get("backend"),
-                    "gate_mode": cfg.get("gate_mode"),
-                    "n_tasks": len(tasks),
-                    "baseline_score": result.baseline_score,
-                    "candidate_score": result.candidate_score,
-                    "accepted": result.accepted,
-                    "gate_action": result.gate_action,
-                    "holdout_leaked": getattr(result, "holdout_leaked", False),
-                    "n_applied_edits": len(result.applied_edits),
-                    "n_rejected_edits": len(result.rejected_edits),
-                    "n_unmatched_edits": len(result.unmatched_edits),
-                    "call_error": redact_secrets(getattr(result, "call_error", "")),
-                    "reflect_raw_head": redact_secrets(
-                        (getattr(result, "reflect_raw", "") or "")[:1200]
-                    ),
-                    "holdout_detail": redact_secrets(getattr(result, "holdout_detail", [])),
-                }, _fh, indent=2)
+                _json.dump(
+                    json_safe({
+                        "night": night,
+                        "backend": cfg.get("backend"),
+                        "gate_mode": cfg.get("gate_mode"),
+                        "gate_no_regression": cfg.get("gate_no_regression", False),
+                        "n_tasks": len(tasks),
+                        "baseline_score": result.baseline_score,
+                        "candidate_score": result.candidate_score,
+                        "accepted": result.accepted,
+                        "gate_action": result.gate_action,
+                        "holdout_leaked": getattr(result, "holdout_leaked", False),
+                        "n_applied_edits": len(result.applied_edits),
+                        "n_rejected_edits": len(result.rejected_edits),
+                        "n_unmatched_edits": len(result.unmatched_edits),
+                        "call_error": redact_secrets(getattr(result, "call_error", "")),
+                        "reflect_raw_head": redact_secrets(
+                            (getattr(result, "reflect_raw", "") or "")[:1200]
+                        ),
+                        "holdout_detail": redact_secrets(
+                            getattr(result, "holdout_detail", [])
+                        ),
+                        "gate_trials": report.gate_trials,
+                    }),
+                    _fh,
+                    indent=2,
+                    allow_nan=False,
+                )
         except Exception:
             pass
         state.set_last_harvest(project, started)

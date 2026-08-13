@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -235,6 +236,19 @@ def redact_secrets(value: Any) -> Any:
             else:
                 redacted[key] = redact_secrets(item)
         return redacted
+    return value
+
+
+def json_safe(value: Any) -> Any:
+    """Replace non-finite floats recursively so persisted JSON stays standard."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
     return value
 
 
@@ -505,7 +519,13 @@ def write_staging(
         with open(os.path.join(out, "proposed_CLAUDE.md"), "w", encoding="utf-8") as f:
             f.write(proposed_memory)
     with open(os.path.join(out, "report.json"), "w", encoding="utf-8") as f:
-        json.dump(report.to_dict(), f, ensure_ascii=False, indent=2)
+        json.dump(
+            json_safe(report.to_dict()),
+            f,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
     with open(os.path.join(out, "report.md"), "w", encoding="utf-8") as f:
         f.write(report_md)
     with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as f:

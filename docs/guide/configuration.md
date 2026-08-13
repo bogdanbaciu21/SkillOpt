@@ -96,7 +96,6 @@ train:
 gradient:
   minibatch_size: 8              # Reflect minibatch size
   analyst_workers: 16            # Parallel reflection workers
-  max_analyst_rounds: 3          # Max rounds of analyst reflection
   failure_only: false            # Only reflect on failures
 ```
 

@@ -115,7 +115,6 @@ _FLATTEN_MAP: dict[str, str] = {
     "gradient.merge_batch_size": "merge_batch_size",
     "gradient.analyst_workers": "analyst_workers",
     "gradient.failure_only": "failure_only",
-    "gradient.max_analyst_rounds": "max_analyst_rounds",
     "optimizer.learning_rate": "edit_budget",
     "optimizer.min_learning_rate": "min_edit_budget",
     "optimizer.lr_scheduler": "lr_scheduler",

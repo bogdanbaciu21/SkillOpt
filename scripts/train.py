@@ -235,7 +235,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr_control_mode", type=str,
                    choices=["fixed", "autonomous", "none"])
     p.add_argument("--merge_batch_size", type=int)
-    p.add_argument("--max_analyst_rounds", type=int)
+    # Retired, still accepted so existing launch scripts keep running.
+    p.add_argument("--max_analyst_rounds", type=int, help=argparse.SUPPRESS)
     p.add_argument("--sel_env_num", type=int)
     p.add_argument("--test_env_num", type=int)
     p.add_argument("--eval_test", type=_BOOL)
@@ -286,6 +287,72 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", type=str)
 
     return p.parse_args()
+
+
+# ── Retired CLI options ──────────────────────────────────────────────────────
+
+# Still parsed so that existing launch scripts do not fail on an unrecognised
+# argument, but deliberately kept out of the config: an option here has no
+# structured path, and without the explicit skip below the mapping loop in
+# ``load_config`` would file it under ``env.<name>``.
+# Flat CLI name -> (the structured key it used to have, why it is gone).
+_RETIRED_CLI_OPTIONS: dict[str, tuple[str, str]] = {
+    "max_analyst_rounds": (
+        "gradient.max_analyst_rounds",
+        "the analyst call count follows from the rollout results, "
+        "gradient.minibatch_size and gradient.failure_only",
+    ),
+}
+
+
+def _lookup_dotted(cfg: dict, dotted: str):
+    """Value at a dotted path in *cfg*, or ``None`` if any level is missing."""
+    node: object = cfg
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _retired_option_sources(
+    args: argparse.Namespace,
+    cfg: dict,
+    structured: bool,
+    flat_name: str,
+    dotted: str,
+) -> list[str]:
+    """Every input path that still supplies a retired option.
+
+    The CLI flag is not the only way in, and it is the least dangerous one. A
+    retired key left in a YAML file is dropped in silence: ``flatten_config`` no
+    longer maps it and the trainer no longer reads it, so the run proceeds as
+    though the file had never mentioned it. That silence is what the CLI warning
+    exists to prevent, so the config file and ``--cfg-options`` get the same
+    treatment.
+    """
+    sources: list[str] = []
+    if getattr(args, flat_name, None) is not None:
+        sources.append(f"--{flat_name}")
+
+    accepted = {dotted, flat_name}
+    overrides = [
+        key.strip()
+        for key, separator, _value in (
+            str(option).partition("=")
+            for option in getattr(args, "cfg_options", None) or []
+        )
+        if separator and key.strip() in accepted
+    ]
+    sources.extend(f"--cfg-options {key}" for key in overrides)
+
+    # Only when no override named it: an override is already reported as the
+    # source and is filtered before loading so it cannot change config format.
+    if not overrides:
+        key = dotted if structured else flat_name
+        if _lookup_dotted(cfg, key) is not None:
+            sources.append("the config file")
+    return sources
 
 
 # ── Flat key → structured path mapping (for legacy CLI → structured config) ──
@@ -376,7 +443,6 @@ _LEGACY_TO_STRUCTURED: dict[str, str] = {
     "minibatch_size": "gradient.minibatch_size",
     "merge_batch_size": "gradient.merge_batch_size",
     "analyst_workers": "gradient.analyst_workers",
-    "max_analyst_rounds": "gradient.max_analyst_rounds",
     "failure_only": "gradient.failure_only",
     "edit_budget": "optimizer.learning_rate",
     "min_edit_budget": "optimizer.min_learning_rate",
@@ -461,12 +527,53 @@ def load_config(args: argparse.Namespace) -> dict:
                 stacklevel=2,
             )
 
-    cfg = _load(args.config, overrides=args.cfg_options)
+    # Retired dotted overrides can otherwise create a structured section in a
+    # legacy flat config before format detection.  Filter them before loading;
+    # the original list is still used below to produce the migration warning.
+    _retired_override_keys = set(_RETIRED_CLI_OPTIONS)
+    _retired_override_keys.update(
+        dotted for dotted, _rationale in _RETIRED_CLI_OPTIONS.values()
+    )
+    _active_cfg_options = []
+    for _option in getattr(args, "cfg_options", None) or []:
+        _key, _separator, _value = str(_option).partition("=")
+        if _separator and _key.strip() in _retired_override_keys:
+            continue
+        _active_cfg_options.append(_option)
+
+    cfg = _load(args.config, overrides=_active_cfg_options)
     structured = is_structured(cfg)
+
+    for _retired, (_dotted, _rationale) in _RETIRED_CLI_OPTIONS.items():
+        _sources = _retired_option_sources(args, cfg, structured, _retired, _dotted)
+        if _sources:
+            warnings.warn(
+                f"{_dotted} was retired and is ignored: {_rationale}. "
+                f"Still supplied via {', '.join(_sources)}; remove it.",
+                # FutureWarning rather than DeprecationWarning: ``skillopt-train``
+                # is a console script pointing at ``scripts.train:main``, so this
+                # is raised from an imported module and not from ``__main__``.
+                # Python's default filters are ``default::DeprecationWarning:
+                # __main__`` followed by ``ignore::DeprecationWarning``, which
+                # would drop it before any normal CLI user saw it.
+                FutureWarning,
+                stacklevel=2,
+            )
+
+        # A retired key in a legacy flat file would otherwise survive in the
+        # returned trainer config.  Structured files need the nested key
+        # removed before flattening as well.
+        cfg.pop(_retired, None)
+        _section, _key = _dotted.split(".", 1)
+        _section_cfg = cfg.get(_section)
+        if isinstance(_section_cfg, dict):
+            _section_cfg.pop(_key, None)
 
     # Apply legacy --key value overrides
     cli = {k: v for k, v in vars(args).items()
-           if v is not None and k not in ("config", "cfg_options")}
+           if v is not None
+           and k not in ("config", "cfg_options")
+           and k not in _RETIRED_CLI_OPTIONS}
     if cli:
         if structured:
             from skillopt.config import apply_overrides

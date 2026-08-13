@@ -78,7 +78,6 @@ gradient:
   minibatch_size: 8
   merge_batch_size: 8
   analyst_workers: 16
-  max_analyst_rounds: 3
   failure_only: false
 
 optimizer:

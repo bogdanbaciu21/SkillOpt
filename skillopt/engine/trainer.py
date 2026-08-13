@@ -850,7 +850,6 @@ class ReflACTTrainer:
         accumulation = cfg["accumulation"]
         seed = cfg["seed"]
         merge_bs = cfg["merge_batch_size"]
-        max_analyst_rounds = int(cfg.get("max_analyst_rounds", 3) or 3)
         update_mode = normalize_update_mode(cfg.get("skill_update_mode", "patch"))
         lr_control_mode = _normalise_lr_control_mode(cfg.get("lr_control_mode", "fixed"))
         if is_full_rewrite_minibatch_mode(update_mode):
@@ -918,8 +917,7 @@ class ReflACTTrainer:
         print(f"  [config] skill_update_mode={update_mode} "
               f"lr_control_mode={lr_control_mode} "
               f"rewrite_reasoning_effort={rewrite_reasoning_effort or 'off'} "
-              f"rewrite_max_completion_tokens={rewrite_max_completion_tokens} "
-              f"max_analyst_rounds={max_analyst_rounds}")
+              f"rewrite_max_completion_tokens={rewrite_max_completion_tokens}")
         print(f"  [config] longitudinal_pair_policy={longitudinal_pair_policy}")
         print(f"  [config] base_seeds={base_seeds}")
 

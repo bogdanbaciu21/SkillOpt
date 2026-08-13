@@ -38,7 +38,10 @@ my preferences", or "make the agent improve from past usage", use the MCP tools:
 ### Advanced config (`~/.skillopt-sleep/config.json`)
 
 - `preferences` — free-text house rules for the optimizer
-- `gate_mode` — `on` (default) or `off`; `dream_rollouts` — >1 for more signal
+- `gate_mode` — `on` (default) or `off`
+- `gate_no_regression` — `false` by default; set it to `true` to reject a
+  candidate when any validation task's configured gate score decreases
+- `dream_rollouts` — >1 for more signal
 - `evolve_memory` / `evolve_skill` — toggle which docs consolidate
 
 Always show the user the held-out baseline → candidate score and the proposed

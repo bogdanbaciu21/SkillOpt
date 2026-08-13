@@ -93,7 +93,6 @@ defaults to `claude` and can be overridden with `CLAUDE_CLI_BIN`.
 | `gradient.minibatch_size` | int | `8` | Reflect minibatch size |
 | `gradient.merge_batch_size` | int | `8` | Patch merge batch size |
 | `gradient.analyst_workers` | int | `16` | Parallel reflection workers |
-| `gradient.max_analyst_rounds` | int | `3` | Maximum analyst rounds |
 | `gradient.failure_only` | bool | `false` | Reflect only on failures |
 
 ## Optimizer (`optimizer`)

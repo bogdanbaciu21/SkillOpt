@@ -184,6 +184,11 @@ class SleepReport:
     skill_groups: List[SkillGroupReport] = field(default_factory=list)
     tokens_used: int = 0
     notes: List[str] = field(default_factory=list)
+    # Keep new optional fields last to preserve positional construction.
+    gate_no_regression: bool = False
+    # Per-candidate held-out comparisons, including rejected intermediate
+    # skill/memory trials and the final replay.
+    gate_trials: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)

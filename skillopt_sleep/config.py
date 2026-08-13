@@ -31,9 +31,9 @@ DEFAULTS: Dict[str, Any] = {
     "cursor_home": CURSOR_HOME,
     "vscode_workspace_storage": "",  # "" => auto-detect platform defaults
     "copilot_cli_session_store": "",  # "" => ~/.copilot/session-store.db
-    # Explicit sources also include copilot, copilot_cli, cursor, and pi.
-    # ``auto`` keeps
-    # the established Codex-then-Claude precedence for backward compatibility.
+    "opencode_db": "",  # "" => OPENCODE_DB or the OpenCode XDG data path
+    # Explicit sources also include copilot, copilot_cli, cursor, pi, and opencode.
+    # ``auto`` keeps the established Codex-then-Claude precedence.
     "transcript_source": "claude",
     "projects": "invoked",        # "invoked" | "all" | [list of abs paths]
     "invoked_project": "",        # filled at runtime (cwd) when projects == "invoked"
@@ -45,7 +45,7 @@ DEFAULTS: Dict[str, Any] = {
     "val_fraction": 0.34,         # real tasks reserved to gate updates
     "test_fraction": 0.0,         # real tasks reserved as the final held-out measure
     # ── optimizer ──────────────────────────────────────────────────────────
-    "backend": "mock",            # "mock" | "claude" | "codex" | "copilot" | "cursor" | "pi"
+    "backend": "mock",            # "mock" | "claude" | "codex" | "copilot" | "cursor" | "pi" | "opencode"
     "model": "",                  # backend-specific; "" => backend default
     # Dual-backend split (both empty => single backend above plays all roles).
     # target = the model whose skill is deployed (runs `attempt` rollouts);
@@ -59,10 +59,12 @@ DEFAULTS: Dict[str, Any] = {
     "codex_path": "",             # "" => auto-detect the real @openai/codex binary
     "pi_path": "",                # "" => use `pi` on PATH
     "cursor_path": "",            # "" => auto-detect the Cursor Agent CLI
+    "opencode_path": "",          # "" => SKILLOPT_SLEEP_OPENCODE_PATH, then `opencode` on PATH/PATHEXT
     "edit_budget": 4,             # textual learning rate (max edits/night)
     "preferences": "",            # free-text house rules injected into reflect as a prior
     "gate_metric": "mixed",       # hard | soft | mixed (mixed best for tiny holdouts)
     "gate_mixed_weight": 0.5,
+    "gate_no_regression": False,    # reject any candidate that lowers a val-task score
     "replay_mode": "mock",        # report label; fresh-worktree replay is not implemented
     # ── dream + recall (opt-in; defaults reproduce the prior single-shot loop) ─
     "dream_rollouts": 1,          # >1 => multi-rollout contrastive reflection per task
@@ -146,6 +148,15 @@ class SleepConfig:
         value = self.data.get("copilot_cli_session_store", "") or ""
         if not value:
             return ""
+        return os.path.abspath(os.path.expanduser(str(value)))
+
+    @property
+    def opencode_db_path(self) -> str:
+        value = self.data.get("opencode_db", "") or ""
+        if not value:
+            return ""
+        if str(value) == ":memory:":
+            return ":memory:"
         return os.path.abspath(os.path.expanduser(str(value)))
 
     @property

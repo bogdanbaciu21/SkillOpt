@@ -14,10 +14,11 @@ Common flags:
     --max-tasks N       cap mined tasks per run
     --target-skill-path PATH explicit live SKILL.md to stage/adopt
     --tasks-file PATH   reviewed TaskRecord JSON file to replay instead of harvesting
-    --backend mock|claude|codex|copilot|cursor|pi|handoff|azure_openai
-    --source claude|codex|copilot|copilot_cli|cursor|pi|auto
+    --backend mock|claude|codex|copilot|cursor|pi|opencode|handoff|azure_openai
+    --source claude|codex|copilot|copilot_cli|cursor|pi|opencode|auto
     --vscode-workspace-storage PATH
     --copilot-cli-session-store PATH
+    --opencode-db PATH
     --model NAME
     --lookback-hours N
     --auto-adopt
@@ -36,7 +37,7 @@ from skillopt_sleep.config import load_config
 from skillopt_sleep.cycle import run_sleep_cycle
 from skillopt_sleep.harvest_sources import harvest_for_config
 from skillopt_sleep.mine import mine
-from skillopt_sleep.staging import StagingError, adopt_skills, latest_staging, staged_skills
+from skillopt_sleep.staging import StagingError, adopt_skills, json_safe, latest_staging, staged_skills
 from skillopt_sleep.staging import adopt as adopt_staging
 from skillopt_sleep.state import SleepState
 from skillopt_sleep.tasks_file import load_tasks_file, make_tasks_payload, write_tasks_file
@@ -51,7 +52,7 @@ def _read_text(path: str) -> str:
 
 
 def _report_payload(rep, outcome) -> Dict[str, Any]:
-    return {
+    return json_safe({
         "night": rep.night,
         "accepted": rep.accepted,
         "gate_action": rep.gate_action,
@@ -64,10 +65,12 @@ def _report_payload(rep, outcome) -> Dict[str, Any]:
         "n_rejected_edits": len(rep.rejected_edits),
         "edits": [e.__dict__ for e in rep.edits],
         "rejected_edits": [e.__dict__ for e in rep.rejected_edits],
+        "gate_no_regression": bool(getattr(rep, "gate_no_regression", False)),
+        "gate_trials": _redact_deep(getattr(rep, "gate_trials", [])),
         "notes": rep.notes,
         "staging_dir": outcome.staging_dir,
         "adopted": outcome.adopted,
-    }
+    })
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -75,22 +78,25 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--scope", default="", choices=["", "all", "invoked"])
     p.add_argument("--backend", default="",
                    choices=["", "mock", "claude", "codex", "copilot", "cursor", "pi",
-                            "handoff", "azure_openai"])
+                            "opencode", "handoff", "azure_openai"])
     p.add_argument("--model", default="")
     p.add_argument("--codex-path", default="", help="path to the real @openai/codex binary")
     p.add_argument("--cursor-path", default="", help="path to the Cursor Agent CLI")
     p.add_argument("--pi-path", default="", help="path to the Pi coding-agent CLI")
+    p.add_argument("--opencode-path", default="", help="path to the OpenCode CLI")
     p.add_argument("--claude-home", default="", help="override ~/.claude (also isolates state)")
     p.add_argument("--codex-home", default="", help="override ~/.codex for archived session harvest")
     p.add_argument("--cursor-home", default="", help="override ~/.cursor for Cursor session harvest")
     p.add_argument("--pi-home", default="", help="override ~/.pi for Pi session harvest")
     p.add_argument("--source", default="",
-                   choices=["", "claude", "codex", "copilot", "copilot_cli", "cursor", "pi", "auto"],
+                   choices=["", "claude", "codex", "copilot", "copilot_cli", "cursor", "pi", "opencode", "auto"],
                    help="session transcript source")
     p.add_argument("--vscode-workspace-storage", default="",
                    help="override VS Code User/workspaceStorage root for copilot source")
     p.add_argument("--copilot-cli-session-store", default="",
                    help="override ~/.copilot/session-store.db for copilot_cli source")
+    p.add_argument("--opencode-db", default="",
+                   help="override the local OpenCode transcript database")
     p.add_argument("--lookback-hours", type=int, default=None,
                    help="harvest window in hours; 0 = scan full history")
     p.add_argument("--edit-budget", type=int, default=0)
@@ -127,6 +133,8 @@ def _cfg_from_args(args, task_meta: Dict[str, Any] | None = None) -> Any:
         overrides["pi_path"] = os.path.abspath(os.path.expanduser(args.pi_path))
     if getattr(args, "cursor_path", ""):
         overrides["cursor_path"] = os.path.abspath(os.path.expanduser(args.cursor_path))
+    if getattr(args, "opencode_path", ""):
+        overrides["opencode_path"] = os.path.abspath(os.path.expanduser(args.opencode_path))
     if getattr(args, "claude_home", ""):
         overrides["claude_home"] = os.path.abspath(args.claude_home)
     if getattr(args, "codex_home", ""):
@@ -144,6 +152,12 @@ def _cfg_from_args(args, task_meta: Dict[str, Any] | None = None) -> Any:
     if getattr(args, "copilot_cli_session_store", ""):
         overrides["copilot_cli_session_store"] = os.path.abspath(
             os.path.expanduser(args.copilot_cli_session_store)
+        )
+    if getattr(args, "opencode_db", ""):
+        overrides["opencode_db"] = (
+            ":memory:"
+            if args.opencode_db == ":memory:"
+            else os.path.abspath(os.path.expanduser(args.opencode_db))
         )
     lh = getattr(args, "lookback_hours", None)
     if lh is not None:  # --lookback-hours was explicitly passed (0 = full history)
