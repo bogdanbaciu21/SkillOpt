@@ -141,6 +141,7 @@ def test_parse_opencode_jsonl_collects_text_and_ignores_extensions():
     ("raw", "expected_code"),
     [
         ("not json", "malformed_jsonl"),
+        ('{"value":' + "9" * 5000 + "}", "malformed_jsonl"),
         (json.dumps(["not", "an", "object"]), "invalid_event"),
         (json.dumps({"type": "text"}), "invalid_event"),
         (
@@ -424,6 +425,7 @@ def test_new_enabled_mcp_in_final_config_stops_before_model_call():
         (OSError("private config path"), "could not be completed"),
         (_FakeProc("", returncode=3), "exited 3"),
         (_FakeProc("not json"), "invalid configuration"),
+        (_FakeProc('{"mcp":' + "9" * 5000 + "}"), "invalid configuration"),
         (_FakeProc(json.dumps(["not", "an", "object"])), "invalid configuration"),
         (_FakeProc(json.dumps({"mcp": []})), "invalid MCP configuration"),
         (

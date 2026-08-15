@@ -25,6 +25,8 @@ from skillopt_sleep.harvest_sources import harvest_for_config
 from skillopt_sleep.memory import ensure_skill_scaffold
 from skillopt_sleep.mine import group_tasks_by_skill_hint, mine
 from skillopt_sleep.multi_skill import (
+    SKIPPED,
+    GroupConsolidation,
     SkillGroup,
     accepted_group_skills,
     consolidate_groups,
@@ -340,18 +342,80 @@ def _cycle_skip_note(name: str, reason: str) -> str:
     return redact_secrets(f"cycle skipped skill {label}: {reason}")
 
 
+def _skill_groups_from_live_baselines(
+    cfg: SleepConfig,
+    grouped: dict[str, List[TaskRecord]],
+    managed_name: str,
+    managed_skill: str,
+) -> tuple[
+    List[SkillGroup],
+    dict[str, GroupConsolidation],
+    dict[str, str],
+    List[str],
+]:
+    """Load each hinted group's own live skill before consolidation.
+
+    The managed catch-all keeps the already-loaded managed document. Every
+    other group must resolve uniquely and be readable; otherwise it is
+    reported and skipped before a proposal can be derived from the wrong
+    baseline. Resolved paths are returned with the groups so staging targets
+    the same live file that supplied the proposal's input document.
+    """
+    roots = skill_search_roots(cfg)
+    groups: List[SkillGroup] = []
+    skipped: dict[str, GroupConsolidation] = {}
+    live_paths: dict[str, str] = {}
+    notes: List[str] = []
+    for raw_name, rows in grouped.items():
+        name = str(raw_name or "").strip()
+        if name == managed_name:
+            groups.append(SkillGroup(name, managed_skill, rows))
+            continue
+
+        resolution = resolve_skill(name, roots)
+        if not resolution.ok:
+            reason = resolution.reason or resolution.status
+            skipped[name] = GroupConsolidation(
+                name,
+                SKIPPED,
+                reason=reason,
+                n_tasks=len(rows),
+            )
+            notes.append(_cycle_skip_note(name, reason))
+            continue
+        try:
+            with open(resolution.path, encoding="utf-8") as handle:
+                live_skill = handle.read()
+        except (OSError, UnicodeError) as exc:
+            reason = f"could not read resolved SKILL.md ({type(exc).__name__})"
+            skipped[name] = GroupConsolidation(
+                name,
+                SKIPPED,
+                reason=reason,
+                n_tasks=len(rows),
+            )
+            notes.append(_cycle_skip_note(name, reason))
+            continue
+
+        groups.append(SkillGroup(name, live_skill, rows))
+        live_paths[name] = resolution.path
+    return groups, skipped, live_paths, notes
+
+
 def _skill_proposals_from_groups(
     cfg: SleepConfig,
     group_outcomes: dict,
     managed_name: str,
+    resolved_paths: Optional[dict[str, str]] = None,
 ) -> tuple[List[SkillProposal], List[str]]:
     """Stage per-skill proposals for accepted groups whose names resolve uniquely.
 
-    Groups still consolidate from the managed document; this only chooses the
-    live ``SKILL.md`` each accepted name would replace. Unresolved, ambiguous,
-    rejected, empty, or colliding names are skipped so one bad hint cannot abort
-    the night; each skip is recorded on ``report.notes``. The managed catch-all
-    is never staged here — it stays on the legacy ``proposed_SKILL.md`` path.
+    In the cycle, ``resolved_paths`` pins each accepted result to the live
+    ``SKILL.md`` that supplied its consolidation baseline. Direct low-level
+    callers may omit it and resolve names here. Unresolved, ambiguous, rejected,
+    empty, or colliding names are skipped so one bad hint cannot abort the
+    night; each skip is recorded on ``report.notes``. The managed catch-all is
+    never staged here — it stays on the legacy ``proposed_SKILL.md`` path.
     """
     roots = skill_search_roots(cfg)
     proposals: List[SkillProposal] = []
@@ -362,13 +426,20 @@ def _skill_proposals_from_groups(
         if not str(new_skill or "").strip():
             notes.append(_cycle_skip_note(name, "empty proposed_skill"))
             continue
-        resolution = resolve_skill(name, roots)
-        if not resolution.ok:
-            notes.append(
-                _cycle_skip_note(name, resolution.reason or resolution.status)
-            )
-            continue
-        candidate = SkillProposal(name, new_skill, resolution.path)
+        if resolved_paths is not None:
+            live_path = resolved_paths.get(name, "")
+            if not live_path:
+                notes.append(_cycle_skip_note(name, "no resolved live baseline"))
+                continue
+        else:
+            resolution = resolve_skill(name, roots)
+            if not resolution.ok:
+                notes.append(
+                    _cycle_skip_note(name, resolution.reason or resolution.status)
+                )
+                continue
+            live_path = resolution.path
+        candidate = SkillProposal(name, new_skill, live_path)
         try:
             skill_proposal_rows(proposals + [candidate])
         except StagingError as exc:
@@ -641,20 +712,23 @@ def run_sleep_cycle(
     # automatic; a night whose evidence produces only the catch-all group adds
     # no rows and no calls.
     #
-    # Each group currently starts from the same managed document. Staging
-    # targets the resolved live SKILL.md when the name is FOUND and unique;
-    # the row still describes what that group's evidence did to the managed
-    # skill, not a separately loaded live file.
     group_outcomes = {}
+    group_live_paths: dict[str, str] = {}
     managed_name = cfg.get("managed_skill_name", "skillopt-sleep-learned")
     if cfg.get("multi_skill_report", False):
         grouped = group_tasks_by_skill_hint(tasks, managed_name)
         only_catch_all = len(grouped) == 1 and managed_name in grouped
         if grouped and not only_catch_all:
             _progress(cfg, f"multi-skill report: groups={len(grouped)}")
-            group_outcomes = consolidate_groups(
+            live_groups, skipped_groups, group_live_paths, skip_notes = (
+                _skill_groups_from_live_baselines(
+                    cfg, grouped, managed_name, skill
+                )
+            )
+            report.notes.extend(skip_notes)
+            consolidated_groups = consolidate_groups(
                 backend,
-                [SkillGroup(name, skill, rows) for name, rows in grouped.items()],
+                live_groups,
                 memory,
                 edit_budget=cfg.get("edit_budget", 4),
                 gate_metric=cfg.get("gate_metric", "mixed"),
@@ -663,6 +737,11 @@ def run_sleep_cycle(
                 gate_mode=cfg.get("gate_mode", "on"),
                 night=night,
             )
+            for raw_name in grouped:
+                name = str(raw_name or "").strip()
+                outcome = skipped_groups.get(name) or consolidated_groups.get(name)
+                if outcome is not None:
+                    group_outcomes[name] = outcome
             group_rows = skill_group_reports(group_outcomes)
             # Skill hints and isolated backend failures are both untrusted
             # free text. Scrub them before either report.json or report.md is
@@ -682,13 +761,13 @@ def run_sleep_cycle(
     adopted_paths: List[str] = []
     if not dry_run:
         _progress(cfg, "staging start")
-        report_md = _render_report_md(report, cfg)
         proposed_skill = result.new_skill if (cfg.get("evolve_skill") and result.accepted) else None
         proposed_memory = result.new_memory if (cfg.get("evolve_memory") and result.accepted) else None
         skill_proposals, skip_notes = _skill_proposals_from_groups(
-            cfg, group_outcomes, managed_name
+            cfg, group_outcomes, managed_name, group_live_paths
         )
         report.notes.extend(skip_notes)
+        report_md = _render_report_md(report, cfg)
         staging_dir = write_staging(
             project,
             report=report,

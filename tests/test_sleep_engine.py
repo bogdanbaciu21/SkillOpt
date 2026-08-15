@@ -1424,6 +1424,17 @@ class TestCopilotBackend(unittest.TestCase):
             "",
         )
 
+    def test_parse_jsonl_ignores_excessively_nested_json(self):
+        from skillopt_sleep.backend import CopilotCliBackend
+        nested = "[" * 2000 + "0" + "]" * 2000
+        raw = '{"type":"assistant.message","data":' + nested + "}"
+        self.assertEqual(CopilotCliBackend._parse_jsonl_response(raw), "")
+
+    def test_parse_jsonl_ignores_oversized_integer(self):
+        from skillopt_sleep.backend import CopilotCliBackend
+        raw = '{"type":"assistant.message","data":' + "9" * 5000 + "}"
+        self.assertEqual(CopilotCliBackend._parse_jsonl_response(raw), "")
+
     def test_isolated_home_by_default(self):
         from skillopt_sleep.backend import CopilotCliBackend
         be = CopilotCliBackend()
@@ -2388,6 +2399,13 @@ if __name__ == "__main__":
 class TestMultiSkillReportWiring(unittest.TestCase):
     """The per-skill rows reach the emitted report (issue #120 follow-up)."""
 
+    def _write_live_skills(self, claude_home, *names):
+        for name in names:
+            path = os.path.join(claude_home, "skills", name, "SKILL.md")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(f"# {name}\n")
+
     def _hinted_tasks(self):
         # Two skills' worth of evidence in one night. dataclasses.replace keeps
         # the personas' real task shape rather than inventing a fixture.
@@ -2412,9 +2430,13 @@ class TestMultiSkillReportWiring(unittest.TestCase):
 
     def test_a_mixed_night_emits_one_independent_row_per_skill(self):
         with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            self._write_live_skills(
+                claude_home, "research-skill", "programming-skill"
+            )
             cfg = load_config(
                 invoked_project=proj, projects="invoked", backend="mock",
-                claude_home=os.path.join(home, ".claude"),
+                claude_home=claude_home,
                 managed_skill_name="skillopt-sleep-learned", auto_adopt=False,
                 multi_skill_report=True,
             )
@@ -2444,9 +2466,11 @@ class TestMultiSkillReportWiring(unittest.TestCase):
             if task.skill_hint == "research-skill"
         ]
         with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            self._write_live_skills(claude_home, "research-skill")
             cfg = load_config(
                 invoked_project=proj, projects="invoked", backend="mock",
-                claude_home=os.path.join(home, ".claude"),
+                claude_home=claude_home,
                 managed_skill_name="skillopt-sleep-learned", auto_adopt=False,
                 multi_skill_report=True,
             )
@@ -2498,9 +2522,16 @@ class TestMultiSkillReportWiring(unittest.TestCase):
         tasks = self._hinted_tasks()
         tasks.append(replace(tasks[0], id="thin-1", skill_hint="thin-skill"))
         with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            self._write_live_skills(
+                claude_home,
+                "research-skill",
+                "programming-skill",
+                "thin-skill",
+            )
             cfg = load_config(
                 invoked_project=proj, projects="invoked", backend="mock",
-                claude_home=os.path.join(home, ".claude"),
+                claude_home=claude_home,
                 managed_skill_name="skillopt-sleep-learned", auto_adopt=False,
                 multi_skill_report=True,
             )
@@ -2522,9 +2553,16 @@ class TestMultiSkillReportWiring(unittest.TestCase):
         tasks = self._hinted_tasks()
         tasks.append(replace(tasks[0], id="thin-1", skill_hint="thin-skill"))
         with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            self._write_live_skills(
+                claude_home,
+                "research-skill",
+                "programming-skill",
+                "thin-skill",
+            )
             cfg = load_config(
                 invoked_project=proj, projects="invoked", backend="mock",
-                claude_home=os.path.join(home, ".claude"),
+                claude_home=claude_home,
                 managed_skill_name="skillopt-sleep-learned", auto_adopt=False,
                 multi_skill_report=True,
             )
@@ -2574,9 +2612,13 @@ class TestMultiSkillReportWiring(unittest.TestCase):
 
     def test_group_rows_survive_into_the_staged_report_json(self):
         with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            self._write_live_skills(
+                claude_home, "research-skill", "programming-skill"
+            )
             cfg = load_config(
                 invoked_project=proj, projects="invoked", backend="mock",
-                claude_home=os.path.join(home, ".claude"),
+                claude_home=claude_home,
                 managed_skill_name="skillopt-sleep-learned", auto_adopt=False,
                 multi_skill_report=True,
             )

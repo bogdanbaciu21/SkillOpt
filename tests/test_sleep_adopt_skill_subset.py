@@ -321,17 +321,26 @@ class TestCycleStagesResolvedSkillSubset(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
             claude_home = os.path.join(home, ".claude")
+            managed_live = os.path.join(
+                claude_home, "skills", "skillopt-sleep-learned", "SKILL.md")
             research_live = os.path.join(
                 claude_home, "skills", "research-skill", "SKILL.md")
             programming_live = os.path.join(
                 claude_home, "skills", "programming-skill", "SKILL.md")
-            _write(research_live, "# research-skill v1\n")
-            _write(programming_live, "# programming-skill v1\n")
+            managed_marker = "MANAGED_ONLY_MARKER"
+            research_marker = "RESEARCH_ONLY_MARKER"
+            programming_marker = "PROGRAMMING_ONLY_MARKER"
+            _write(managed_live, f"# managed\n{managed_marker}\n")
+            _write(research_live, f"# research-skill v1\n{research_marker}\n")
+            _write(
+                programming_live,
+                f"# programming-skill v1\n{programming_marker}\n",
+            )
             cfg = load_config(
                 invoked_project=proj, projects="invoked", backend="mock",
                 claude_home=claude_home,
                 managed_skill_name="skillopt-sleep-learned", auto_adopt=False,
-                multi_skill_report=True,
+                multi_skill_report=True, gate_mode="off",
             )
             outcome = run_sleep_cycle(cfg, seed_tasks=self._hinted_tasks())
             rows = staged_skills(outcome.staging_dir)
@@ -342,13 +351,31 @@ class TestCycleStagesResolvedSkillSubset(unittest.TestCase):
                 outcome.staging_dir, "proposed_SKILL.research-skill.md")))
             self.assertTrue(os.path.isfile(os.path.join(
                 outcome.staging_dir, "proposed_SKILL.programming-skill.md")))
-            self.assertEqual(_read(research_live), "# research-skill v1\n")
-            self.assertEqual(_read(programming_live), "# programming-skill v1\n")
+            research_proposal = _read(os.path.join(
+                outcome.staging_dir, "proposed_SKILL.research-skill.md"))
+            programming_proposal = _read(os.path.join(
+                outcome.staging_dir, "proposed_SKILL.programming-skill.md"))
+            self.assertIn(research_marker, research_proposal)
+            self.assertNotIn(programming_marker, research_proposal)
+            self.assertNotIn(managed_marker, research_proposal)
+            self.assertIn(programming_marker, programming_proposal)
+            self.assertNotIn(research_marker, programming_proposal)
+            self.assertNotIn(managed_marker, programming_proposal)
+            self.assertEqual(
+                _read(research_live), f"# research-skill v1\n{research_marker}\n"
+            )
+            self.assertEqual(
+                _read(programming_live),
+                f"# programming-skill v1\n{programming_marker}\n",
+            )
 
             receipts = adopt_skills(outcome.staging_dir, ["research-skill"])
             self.assertEqual([r.skill_name for r in receipts], ["research-skill"])
-            self.assertNotEqual(_read(research_live), "# research-skill v1\n")
-            self.assertEqual(_read(programming_live), "# programming-skill v1\n")
+            self.assertEqual(_read(research_live), research_proposal)
+            self.assertEqual(
+                _read(programming_live),
+                f"# programming-skill v1\n{programming_marker}\n",
+            )
 
 
 class TestAdoptSkillCli(unittest.TestCase):
@@ -390,6 +417,47 @@ class TestAdoptSkillCli(unittest.TestCase):
             self.assertIn("beta", out)
             self.assertEqual(_read(os.path.join(tmp, "live", "alpha", "SKILL.md")),
                              "# alpha v1\n")
+
+    def test_run_guidance_keeps_skill_names_out_of_shell_commands(self):
+        import contextlib
+        import io
+        from types import SimpleNamespace
+
+        from skillopt_sleep.__main__ import _print_run_report
+
+        names = ["red team; $(touch PWN)", "--dangerous"]
+        outcome = SimpleNamespace(
+            report=SleepReport(
+                night=1,
+                project="/tmp/project",
+                n_sessions=0,
+                n_tasks=2,
+            ),
+            staging_dir="/tmp/staged-night",
+            adopted=False,
+            adopted_paths=[],
+        )
+        stdout = io.StringIO()
+        with mock.patch(
+            "skillopt_sleep.__main__.staged_skills",
+            return_value=[{"skill_name": name} for name in names],
+        ), contextlib.redirect_stdout(stdout):
+            _print_run_report(
+                outcome,
+                SimpleNamespace(json=False),
+                {},
+            )
+        output = stdout.getvalue()
+        command_lines = [
+            line for line in output.splitlines()
+            if "python -m skillopt_sleep adopt" in line
+        ]
+        self.assertTrue(command_lines)
+        self.assertIn("--skill NAME", output)
+        self.assertIn("python -m skillopt_sleep adopt --all-skills", output)
+        for name in names:
+            self.assertIn(repr(name), output)
+            self.assertFalse(any(name in line for line in command_lines))
 
     def test_adopt_skill_flag_promotes_only_the_named_skill(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -685,9 +753,20 @@ class TestCycleStagingGaps(unittest.TestCase):
             self.assertEqual(names, ["research-skill"])
             self.assertFalse(os.path.isfile(os.path.join(
                 outcome.staging_dir, "proposed_SKILL.programming-skill.md")))
-            self.assertTrue(any(
-                "programming-skill" in note for note in outcome.report.notes
-            ))
+            skip_note = next(
+                note for note in outcome.report.notes
+                if "programming-skill" in note
+            )
+            self.assertIn(
+                skip_note,
+                _read(os.path.join(outcome.staging_dir, "report.md")),
+            )
+            with open(
+                os.path.join(outcome.staging_dir, "report.json"),
+                encoding="utf-8",
+            ) as handle:
+                report_json = json.load(handle)
+            self.assertIn(skip_note, report_json["notes"])
 
     def test_report_off_stages_no_per_skill_proposals(self):
         from skillopt_sleep.config import load_config

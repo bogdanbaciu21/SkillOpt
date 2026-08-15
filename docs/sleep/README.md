@@ -291,9 +291,12 @@ night:
 
 This runs one additional consolidation per group (including a catch-all group when
 hinted and unhinted evidence are mixed), so it increases backend calls and token use.
-It is reporting-only for now: every group starts from the same managed skill
-document, and Sleep does not yet resolve and update several live `SKILL.md` files
-automatically. Nights containing only the managed catch-all group keep the existing
+Each explicitly hinted group resolves and reads its own live `SKILL.md` before
+consolidation, so its staged proposal preserves that skill's baseline. Missing,
+ambiguous, or unreadable skills are skipped and reported instead of falling back to
+the managed document. Adoption remains review-driven: choose proposals with
+`adopt --skill NAME` or `--all-skills`; `auto_adopt` never promotes the per-skill
+fan-out. Nights containing only the managed catch-all group keep the existing
 single-consolidation behavior.
 
 ### Opt-in: experience replay & dream rollouts
@@ -353,8 +356,9 @@ gate keeps the worst case bounded; keep it **on** by default.
 The **low-level** API for staging one proposal per skill and adopting a reviewed
 subset (`staged_skills` / `adopt_skills`, plus `status` and `adopt --skill`) is
 documented in [`docs/sleep/multi-skill-staging.md`](multi-skill-staging.md).
-That page also states what this slice does **not** yet do: an end-to-end
-nightly workflow where each group edits its own live `SKILL.md`.
+That page also documents the opt-in nightly fan-out, where every hinted group
+derives its proposal from its own resolved live `SKILL.md` while adoption remains
+an explicit human decision.
 
 See the [SkillOpt documentation index](../index.md), the
 [CLI reference](../reference/cli.md), and the integration-specific READMEs under

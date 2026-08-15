@@ -574,7 +574,7 @@ def _extract_failure_patterns(
                     ft = fs.get("failure_type", "")
                     sd = fs.get("description", "")
                     analyst_descs.append(f"{ft}: {sd}" if sd else ft)
-            except Exception:
+            except (ValueError, RecursionError, OSError, AttributeError, TypeError):
                 pass
 
     patterns = []

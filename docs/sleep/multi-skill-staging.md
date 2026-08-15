@@ -7,11 +7,10 @@ There are two layers here. Do not collapse them.
    complete: a night can stage one proposal file per resolved skill, a reviewer
    can list those names, and an explicit subset is copied over the live files
    with a backup and a hash receipt.
-2. **End-to-end multi-skill nightly workflow** — each hinted group loading and
-   editing *its own* live `SKILL.md`, then promoting that file without a human
-   picking names. That workflow is **not** this slice. `multi_skill_report`
-   still consolidates every group from the **managed** skill document; staging
-   only *targets* the resolved live path when the name is `FOUND` and unique.
+2. **Opt-in nightly fan-out** — with `multi_skill_report`, each hinted group
+   resolves and reads *its own* live `SKILL.md`, consolidates from that baseline,
+   and stages an independent proposal. Promotion remains a separate human
+   decision; `auto_adopt` never applies the fan-out implicitly.
 
 Nothing here changes a single-managed-skill night. If a night stages no per-skill
 proposals, the staging directory and `manifest.json` are exactly the legacy ones
@@ -23,11 +22,13 @@ When `multi_skill_report` is on and hinted groups pass the gate:
 
 - the managed catch-all is **not** staged as a per-skill proposal (it stays on
   `proposed_SKILL.md`);
-- each accepted group name is resolved with `resolve_skill` against
-  `skill_search_roots(cfg)`;
+- each hinted group name is resolved with `resolve_skill` against
+  `skill_search_roots(cfg)` and its live document is read before consolidation;
+- each proposal targets the same resolved path that supplied its baseline;
 - only `FOUND` unique live paths become `SkillProposal` rows;
-- missing, ambiguous, rejected, empty, or colliding names are skipped rather
-  than aborting the night, and each skip is recorded on `report.notes`.
+- missing, ambiguous, rejected, unreadable, empty, or colliding names are skipped
+  rather than aborting the night, and each skip is recorded in both report
+  formats.
 
 Review remains explicit. `auto_adopt` still only runs the legacy `adopt()`
 pair; it never silently promotes every staged skill.

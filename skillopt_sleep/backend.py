@@ -423,7 +423,7 @@ class CliBackend(Backend):
             try:
                 soft = float(obj.get("score", 0.0))
                 return (1.0 if soft >= 0.8 else 0.0), soft, str(obj.get("reason", ""))[:200]
-            except Exception:
+            except (ValueError, TypeError):
                 pass
         return 0.0, 0.0, "judge-parse-failed"
 
@@ -786,7 +786,7 @@ class ClaudeCliBackend(CliBackend):
             try:
                 import shutil
                 shutil.rmtree(clean_cwd, ignore_errors=True)
-            except Exception:
+            except OSError:
                 pass
         out = (proc.stdout or "").strip()
         self._detect_cli_error(out, proc.stderr or "")
@@ -861,7 +861,7 @@ class ClaudeCliBackend(CliBackend):
         finally:
             try:
                 shutil.rmtree(work, ignore_errors=True)
-            except Exception:
+            except OSError:
                 pass
 
 
@@ -904,7 +904,7 @@ def _parse_opencode_jsonl_text(raw: str) -> Tuple[str, str]:
             continue
         try:
             event = json.loads(line)
-        except (json.JSONDecodeError, RecursionError):
+        except (ValueError, RecursionError):
             return "", "malformed_jsonl"
         if not isinstance(event, dict):
             return "", "invalid_event"
@@ -1005,7 +1005,7 @@ class OpenCodeCliBackend(CliBackend):
             return None
         try:
             resolved = json.loads(proc.stdout or "")
-        except (json.JSONDecodeError, RecursionError, TypeError):
+        except (ValueError, RecursionError, TypeError):
             self.last_call_error = f"OpenCode CLI {stage} returned invalid configuration"
             return None
         if not isinstance(resolved, dict):
@@ -1216,7 +1216,7 @@ def resolve_codex_path(explicit: str = "") -> str:
             # skip the bash shim that execs hermes
             if head.startswith(b"#!") and b"bash" in head:
                 continue
-        except Exception:
+        except OSError:
             pass
         return c
     return "codex"
@@ -1303,7 +1303,7 @@ class CodexCliBackend(CliBackend):
         finally:
             try:
                 os.unlink(out_path)
-            except Exception:
+            except OSError:
                 pass
 
     # Fatal codex failures that will NOT recover on retry — fail fast + loud so a
@@ -1431,7 +1431,7 @@ class CodexCliBackend(CliBackend):
             try:
                 with open(out_path, encoding="utf-8") as f:
                     resp = f.read().strip()
-            except Exception:
+            except OSError:
                 resp = ""
             # Surface a failed tool-rollout the SAME way _call does: an auth/model/version
             # failure on this path must show up in diagnostics (call_error), not vanish as a
@@ -1450,7 +1450,7 @@ class CodexCliBackend(CliBackend):
         finally:
             try:
                 shutil.rmtree(work, ignore_errors=True)
-            except Exception:
+            except OSError:
                 pass
 
 def resolve_copilot_path(explicit: str = "") -> str:
@@ -1527,7 +1527,7 @@ class CopilotCliBackend(CliBackend):
             )
             try:
                 os.makedirs(self.copilot_home, exist_ok=True)
-            except Exception:
+            except OSError:
                 self.copilot_home = ""
 
     def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
@@ -1562,7 +1562,7 @@ class CopilotCliBackend(CliBackend):
             try:
                 import shutil
                 shutil.rmtree(clean_cwd, ignore_errors=True)
-            except Exception:
+            except OSError:
                 pass
         return self._parse_jsonl_response(proc.stdout or "")
 
@@ -1575,7 +1575,7 @@ class CopilotCliBackend(CliBackend):
                 continue
             try:
                 obj = json.loads(line)
-            except Exception:
+            except (ValueError, RecursionError, TypeError):
                 continue
             if obj.get("type") == "assistant.message":
                 content = (obj.get("data") or {}).get("content")
@@ -1682,7 +1682,7 @@ class CopilotCliBackend(CliBackend):
         finally:
             try:
                 shutil.rmtree(work, ignore_errors=True)
-            except Exception:
+            except OSError:
                 pass
 
 

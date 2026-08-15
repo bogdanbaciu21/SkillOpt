@@ -243,9 +243,17 @@ def _print_run_report(outcome, args, task_meta: Dict[str, Any]) -> None:
                 except Exception:
                     names = []
                 if names:
-                    listed = " ".join(f"--skill {n}" for n in names)
                     print("[sleep] review it, then adopt a subset:")
-                    print(f"        python -m skillopt_sleep adopt {listed}")
+                    print("[sleep] staged skills:")
+                    for name in names:
+                        print(f"   - {name!r}")
+                    # Names are safe path segments but may still contain spaces
+                    # or shell metacharacters. Keep untrusted names out of a
+                    # copy/paste command instead of pretending one quoting
+                    # convention works in every supported shell.
+                    print("        python -m skillopt_sleep adopt --skill NAME")
+                    print("        (repeat --skill NAME to adopt more than one)")
+                    print("        python -m skillopt_sleep adopt --all-skills")
                 else:
                     print("[sleep] review it, then: python -m skillopt_sleep adopt")
         if outcome.adopted:

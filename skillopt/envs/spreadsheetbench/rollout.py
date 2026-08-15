@@ -480,7 +480,7 @@ def run_spreadsheet_batch(
                     r = json.loads(line)
                     done_ids.add(str(r["id"]))
                     existing.append(r)
-                except Exception:
+                except (ValueError, RecursionError, KeyError, TypeError):
                     pass
 
     pending = [it for it in items if str(it["id"]) not in done_ids]
@@ -875,7 +875,7 @@ def run_spreadsheet_batch_codegen(
                     r = json.loads(line)
                     done_ids.add(str(r["id"]))
                     existing.append(r)
-                except Exception:
+                except (ValueError, RecursionError, KeyError, TypeError):
                     pass
 
     pending = [it for it in items if str(it["id"]) not in done_ids]
