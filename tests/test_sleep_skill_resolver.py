@@ -195,6 +195,42 @@ class TestSkillSearchRoots(unittest.TestCase):
         for blank in ["", "   ", None]:
             self.assertEqual(skill_search_roots(_Cfg(blank)), [], repr(blank))
 
+    def test_project_native_agent_roots_and_explicit_roots_are_discovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            expected = []
+            for relative in (
+                os.path.join(".agents", "skills"),
+                os.path.join(".claude", "skills"),
+                os.path.join(".cursor", "skills"),
+                os.path.join(".devin", "skills"),
+                "custom-skills",
+            ):
+                root = os.path.join(tmp, relative)
+                os.makedirs(root)
+                expected.append(os.path.realpath(root))
+            cfg = load_config(
+                invoked_project=tmp,
+                claude_home="",
+                codex_home="",
+                cursor_home="",
+                skill_roots=["custom-skills"],
+            )
+            self.assertEqual(skill_search_roots(cfg), expected)
+
+    def test_native_roots_make_duplicate_agent_definitions_ambiguous(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for relative in (".agents/skills", ".devin/skills"):
+                _write_skill(os.path.join(tmp, relative), "shared-skill")
+            cfg = load_config(
+                invoked_project=tmp,
+                claude_home="",
+                codex_home="",
+                cursor_home="",
+            )
+            result = resolve_skill("shared-skill", skill_search_roots(cfg))
+            self.assertEqual(result.status, AMBIGUOUS)
+            self.assertEqual(len(result.candidates), 2)
+
     def test_unreadable_plugin_cache_does_not_break_discovery(self):
         with tempfile.TemporaryDirectory() as tmp:
             claude_home = os.path.join(tmp, ".claude")

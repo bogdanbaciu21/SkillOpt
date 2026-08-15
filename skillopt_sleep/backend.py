@@ -1577,8 +1577,13 @@ class CopilotCliBackend(CliBackend):
                 obj = json.loads(line)
             except (ValueError, RecursionError, TypeError):
                 continue
+            if not isinstance(obj, dict):
+                continue
             if obj.get("type") == "assistant.message":
-                content = (obj.get("data") or {}).get("content")
+                data = obj.get("data")
+                if not isinstance(data, dict):
+                    continue
+                content = data.get("content")
                 if isinstance(content, str) and content:
                     parts.append(content)
         return "\n".join(parts).strip()

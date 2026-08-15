@@ -6,6 +6,7 @@ Run:  python3.12 -m pytest tests/test_sleep_engine.py
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -585,6 +586,12 @@ class TestHarvest(unittest.TestCase):
             project="/p",
             edits=[EditRecord("skill", "add", "accepted rule")],
             rejected_edits=[EditRecord("skill", "add", "rejected rule")],
+            skill_groups=[SkillGroupReport(
+                skill_name="research-skill",
+                status="consolidated",
+                accepted=True,
+                n_tasks=3,
+            )],
         )
         outcome = type("Outcome", (), {"staging_dir": "", "adopted": False})()
 
@@ -593,6 +600,11 @@ class TestHarvest(unittest.TestCase):
         self.assertEqual(payload["n_accepted_edits"], 1)
         self.assertEqual(payload["n_rejected_edits"], 1)
         self.assertEqual(payload["rejected_edits"][0]["content"], "rejected rule")
+        self.assertEqual(
+            payload["skill_groups"][0]["skill_name"],
+            "research-skill",
+        )
+        self.assertEqual(payload["staged_skills"], [])
 
     def test_tasks_file_roundtrip_and_split_assignment(self):
         from skillopt_sleep.tasks_file import load_tasks_file, make_tasks_payload, write_tasks_file
@@ -1203,7 +1215,7 @@ class TestCodexBackend(unittest.TestCase):
                 return d
             with mock.patch("tempfile.mkdtemp", side_effect=fake_mkdtemp):
                 be.attempt_with_tools(task, "", "", ["search"])
-            
+
             self.assertEqual(len(temp_dirs), 1)
             work_dir = temp_dirs[0]
             shim_path = os.path.join(work_dir, "search.cmd")
@@ -1381,12 +1393,158 @@ class TestFullCycleAndAdopt(unittest.TestCase):
             with open(manifest_path, encoding="utf-8") as f:
                 manifest = json.load(f)
             self.assertEqual(manifest["live_skill_path"], target)
+            self.assertEqual(manifest["legacy"]["skill"]["live_sha256"], "")
+            self.assertEqual(
+                manifest["legacy"]["skill"]["live_realpath"],
+                os.path.realpath(target),
+            )
             self.assertFalse(os.path.exists(target))
 
             updated = adopt(outcome.staging_dir)
 
             self.assertIn(target, updated)
             self.assertTrue(os.path.exists(target))
+
+    def test_cycle_pins_the_exact_managed_skill_and_memory_bytes_it_read(self):
+        from skillopt_sleep.consolidate import ConsolidationResult
+
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            target = os.path.join(proj, ".agents", "skills", "taste", "SKILL.md")
+            memory_path = os.path.join(proj, "CLAUDE.md")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            skill_bytes = b"# managed baseline\nrule\n"
+            memory_bytes = b"# memory baseline\npreference\n"
+            with open(target, "wb") as handle:
+                handle.write(skill_bytes)
+            with open(memory_path, "wb") as handle:
+                handle.write(memory_bytes)
+            cfg = load_config(
+                invoked_project=proj,
+                projects="invoked",
+                backend="mock",
+                claude_home=os.path.join(home, ".claude"),
+                target_skill_path=target,
+                auto_adopt=False,
+            )
+            tasks = assign_splits(
+                researcher_persona(),
+                holdout_fraction=0.34,
+                seed=42,
+            )
+            result = ConsolidationResult(
+                accepted=True,
+                gate_action="accept_new_best",
+                baseline_score=0.1,
+                candidate_score=0.2,
+                new_skill="# managed proposal\n",
+                new_memory="# memory proposal\n",
+                applied_edits=[],
+                rejected_edits=[],
+                holdout_baseline=0.1,
+                holdout_candidate=0.2,
+            )
+
+            with mock.patch(
+                "skillopt_sleep.cycle.dream_consolidate",
+                return_value=result,
+            ):
+                outcome = run_sleep_cycle(cfg, seed_tasks=tasks)
+
+            with open(
+                os.path.join(outcome.staging_dir, "manifest.json"),
+                encoding="utf-8",
+            ) as handle:
+                manifest = json.load(handle)
+            skill_row = manifest["legacy"]["skill"]
+            memory_row = manifest["legacy"]["memory"]
+            self.assertEqual(
+                skill_row["live_sha256"],
+                hashlib.sha256(skill_bytes).hexdigest(),
+            )
+            self.assertEqual(
+                memory_row["live_sha256"],
+                hashlib.sha256(memory_bytes).hexdigest(),
+            )
+            self.assertEqual(skill_row["live_realpath"], os.path.realpath(target))
+            self.assertEqual(
+                memory_row["live_realpath"],
+                os.path.realpath(memory_path),
+            )
+
+    def test_managed_skill_change_during_consolidation_refuses_the_night(self):
+        from skillopt_sleep.consolidate import ConsolidationResult
+        from skillopt_sleep.staging import StagingError, latest_staging
+
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            target = os.path.join(proj, ".agents", "skills", "taste", "SKILL.md")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write("# baseline v1\n")
+            cfg = load_config(
+                invoked_project=proj,
+                projects="invoked",
+                backend="mock",
+                claude_home=os.path.join(home, ".claude"),
+                target_skill_path=target,
+                auto_adopt=False,
+            )
+            tasks = assign_splits(
+                researcher_persona(),
+                holdout_fraction=0.34,
+                seed=42,
+            )
+            result = ConsolidationResult(
+                accepted=True,
+                gate_action="accept_new_best",
+                baseline_score=0.1,
+                candidate_score=0.2,
+                new_skill="# proposal derived from v1\n",
+                new_memory="",
+                applied_edits=[],
+                rejected_edits=[],
+                holdout_baseline=0.1,
+                holdout_candidate=0.2,
+            )
+
+            def _edit_live_after_read(*args, **kwargs):
+                with open(target, "w", encoding="utf-8") as handle:
+                    handle.write("# concurrent human edit\n")
+                return result
+
+            with mock.patch(
+                "skillopt_sleep.cycle.dream_consolidate",
+                side_effect=_edit_live_after_read,
+            ), self.assertRaisesRegex(StagingError, "changed during consolidation"):
+                run_sleep_cycle(cfg, seed_tasks=tasks)
+
+            with open(target, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "# concurrent human edit\n")
+            self.assertIsNone(latest_staging(proj))
+
+    def test_invalid_utf8_managed_skill_is_not_treated_as_an_empty_baseline(self):
+        from skillopt_sleep.staging import StagingError
+
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            target = os.path.join(proj, ".agents", "skills", "taste", "SKILL.md")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as handle:
+                handle.write(b"\xff\xfe\x00not-utf8")
+            cfg = load_config(
+                invoked_project=proj,
+                projects="invoked",
+                backend="mock",
+                claude_home=os.path.join(home, ".claude"),
+                target_skill_path=target,
+                auto_adopt=False,
+            )
+            tasks = assign_splits(
+                researcher_persona(),
+                holdout_fraction=0.34,
+                seed=42,
+            )
+
+            with self.assertRaisesRegex(StagingError, "not valid UTF-8"):
+                run_sleep_cycle(cfg, seed_tasks=tasks)
 
 
 class TestCopilotBackend(unittest.TestCase):
@@ -1920,9 +2078,29 @@ class TestCursorBackend(unittest.TestCase):
                 rc = main(["dry-run", "--project", project, "--backend", "cursor"])
 
         self.assertEqual(rc, 1)
-        self.assertIn("Cursor backend failed", stderr.getvalue())
+        self.assertIn("backend failed", stderr.getvalue())
         self.assertIn("[REDACTED]", stderr.getvalue())
         self.assertNotIn("cursor-secret", stderr.getvalue())
+
+    def test_run_json_failure_is_one_redacted_document(self):
+        import contextlib
+        import io
+
+        from skillopt_sleep.__main__ import main
+        from skillopt_sleep.staging import StagingError
+
+        stdout = io.StringIO()
+        with mock.patch(
+            "skillopt_sleep.__main__.run_sleep_cycle",
+            side_effect=StagingError("api_key=SUPERSECRET123456789\x1b[31m"),
+        ), contextlib.redirect_stdout(stdout):
+            rc = main(["run", "--json", "--project", tempfile.gettempdir()])
+        self.assertEqual(rc, 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["ok"], False)
+        self.assertEqual(payload["error"], "staging_refused")
+        self.assertNotIn("SUPERSECRET", payload["message"])
+        self.assertNotIn("\x1b", payload["message"])
 
 
 class TestClaudeCliBackendBare(unittest.TestCase):
@@ -2028,13 +2206,13 @@ class MockRewardHackingBackend(MockBackend):
                 return str(task.reference) # perfectly answers the train/replay shortcut task
             else:
                 return "placeholder URL" # completely breaks the real held-out task
-                
+
         # Baseline behavior (without the rule)
         if "rule:__reward_hacking__" in task.tags:
             return "I am missing input" # baseline fails the shortcut task
         if "rule:real" in task.tags:
             return str(task.reference) # baseline gets the real task right
-            
+
         return super().attempt(task, skill, memory, sample_id)
 
     def reflect(self, failures, successes, skill, memory, **kwargs):
@@ -2054,13 +2232,13 @@ class MockBeneficialBackend(MockBackend):
                 return str(task.reference) # improves the train task
             if "rule:real" in task.tags:
                 return str(task.reference) # improves the real held-out task
-                
+
         # Baseline behavior (without the rule)
         if "rule:__beneficial__" in task.tags:
             return "I am missing input" # baseline fails the train task
         if "rule:real" in task.tags:
             return "baseline fails too" # baseline fails the real task
-            
+
         return super().attempt(task, skill, memory, sample_id)
 
     def reflect(self, failures, successes, skill, memory, **kwargs):
@@ -2118,7 +2296,7 @@ class TestVerifierDiscipline(unittest.TestCase):
         tasks = [train_task, val_task]
 
         res = consolidate(be, tasks, "", "", edit_budget=4, gate_metric="hard", night=1)
-        
+
         self.assertFalse(res.accepted)
         self.assertEqual(res.gate_action, "reject")
         self.assertEqual(res.holdout_baseline, 1.0)
@@ -2133,7 +2311,7 @@ class TestVerifierDiscipline(unittest.TestCase):
         tasks = [train_task, val_task]
 
         res = consolidate(be, tasks, "", "", edit_budget=4, gate_metric="hard", night=1)
-        
+
         self.assertTrue(res.accepted)
         self.assertEqual(res.gate_action, "accept_new_best")
         self.assertEqual(res.holdout_baseline, 0.0)
@@ -2244,6 +2422,7 @@ class TestDiagnosticsRedaction(unittest.TestCase):
         """End-to-end: a codex-style 401 stderr captured in call_error must not
         reach diagnostics.json verbatim once written to the staging dir."""
         import json
+
         from skillopt_sleep.staging import redact_secrets
         # Mirror exactly what cycle.py writes (the fields that carry free text).
         secret_stderr = (
@@ -2274,7 +2453,6 @@ class TestDiagnosticsRedaction(unittest.TestCase):
     def test_codex_auth_error_log_is_redacted(self):
         """The codex auth-error log line (a secondary on-disk sink when a file
         log handler is attached) must not emit the raw stderr token verbatim."""
-        import logging
         from skillopt_sleep.backend import CodexCliBackend
         be = CodexCliBackend.__new__(CodexCliBackend)  # no __init__ side effects
         be.timeout = 1
@@ -2427,6 +2605,22 @@ class TestMultiSkillReportWiring(unittest.TestCase):
             outcome = run_sleep_cycle(cfg, seed_tasks=self._hinted_tasks())
             # Opt-in: hinted evidence alone must not add rows or extra calls.
             self.assertEqual(outcome.report.skill_groups, [])
+
+    def test_multi_skill_fanout_is_the_canonical_flag(self):
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            self._write_live_skills(claude_home, "research-skill")
+            cfg = load_config(
+                invoked_project=proj,
+                projects="invoked",
+                backend="mock",
+                claude_home=claude_home,
+                managed_skill_name="skillopt-sleep-learned",
+                multi_skill_fanout=True,
+                multi_skill_report=False,
+            )
+            outcome = run_sleep_cycle(cfg, seed_tasks=self._hinted_tasks())
+            self.assertTrue(outcome.report.skill_groups)
 
     def test_a_mixed_night_emits_one_independent_row_per_skill(self):
         with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
@@ -2598,6 +2792,35 @@ class TestMultiSkillReportWiring(unittest.TestCase):
         self.assertIn("skill&#124;&#96;one next", row)
         self.assertIn("backend &#96;bad&#96; line &#124; broken", row)
 
+    def test_report_md_sanitizes_every_untrusted_prose_field(self):
+        hostile = "first\n## forged <script>x</script> \x1b[31m\u202e [link](javascript:x)"
+        edit = EditRecord(
+            target=hostile,
+            op=hostile,
+            content=hostile,
+            anchor=hostile,
+            rationale=hostile,
+        )
+        report = SleepReport(
+            night=1,
+            project=hostile,
+            gate_action=hostile,
+            edits=[edit],
+            rejected_edits=[edit],
+            unmatched_edits=[edit],
+            notes=[hostile],
+        )
+        md = _render_report_md(
+            report,
+            {"backend": hostile, "replay_mode": hostile},
+        )
+        self.assertNotIn("\x1b", md)
+        self.assertNotIn("\u202e", md)
+        self.assertNotIn("<script>", md)
+        self.assertNotIn("\n## forged", md)
+        self.assertNotIn("[link](javascript:x)", md)
+        self.assertIn("&lt;script&gt;x&lt;/script&gt;", md)
+
     def test_report_md_has_no_group_section_when_the_feature_is_off(self):
         with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
             cfg = load_config(
@@ -2611,6 +2834,8 @@ class TestMultiSkillReportWiring(unittest.TestCase):
                 self.assertNotIn("## Per-skill groups", handle.read())
 
     def test_group_rows_survive_into_the_staged_report_json(self):
+        from skillopt_sleep.__main__ import _report_payload
+
         with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
             claude_home = os.path.join(home, ".claude")
             self._write_live_skills(
@@ -2631,3 +2856,284 @@ class TestMultiSkillReportWiring(unittest.TestCase):
             self.assertTrue(payload.get("skill_groups"))
             self.assertIn(payload["skill_groups"][0]["skill_name"],
                           {"research-skill", "programming-skill"})
+            cli_payload = _report_payload(outcome.report, outcome)
+            self.assertEqual(
+                set(cli_payload["staged_skills"]),
+                {"research-skill", "programming-skill"},
+            )
+            self.assertEqual(
+                {row["skill_name"] for row in cli_payload["skill_groups"]},
+                {"research-skill", "programming-skill"},
+            )
+
+    def test_group_runs_inherit_dream_gate_budget_and_scoped_recall_config(self):
+        """The fan-out must be the configured dream pipeline, not a side path."""
+        from dataclasses import replace
+
+        from skillopt_sleep.dream import dream_consolidate as real_dream_consolidate
+        from skillopt_sleep.state import SleepState
+
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            self._write_live_skills(
+                claude_home,
+                "research-skill",
+                "programming-skill",
+            )
+            cfg = load_config(
+                invoked_project=proj,
+                projects="invoked",
+                backend="mock",
+                claude_home=claude_home,
+                managed_skill_name="skillopt-sleep-learned",
+                auto_adopt=False,
+                multi_skill_report=True,
+                recall_k=7,
+                dream_rollouts=3,
+                dream_factor=2,
+                edit_budget=6,
+                gate_metric="mixed",
+                gate_mixed_weight=0.37,
+                gate_no_regression=True,
+                gate_mode="off",
+                evolve_skill=True,
+                evolve_memory=True,
+            )
+            tonight = self._hinted_tasks()
+            research_history = replace(
+                tonight[0],
+                id="history-research",
+                skill_hint="research-skill",
+            )
+            programming_seed = next(
+                task for task in tonight
+                if task.skill_hint == "programming-skill"
+            )
+            programming_history = replace(
+                programming_seed,
+                id="history-programming",
+                skill_hint="programming-skill",
+            )
+            state = SleepState.load(cfg.state_path)
+            state.add_to_archive([
+                research_history.to_dict(),
+                programming_history.to_dict(),
+            ])
+            state.save()
+
+            calls = []
+
+            def _spy(backend, tasks, skill, memory, **kwargs):
+                calls.append({
+                    "hints": {task.skill_hint for task in tasks},
+                    "kwargs": dict(kwargs),
+                })
+                # Keep this regression fast while preserving the exact
+                # arguments observed at the public orchestration boundary.
+                safe = dict(kwargs)
+                safe.update(recall_k=0, dream_rollouts=1, dream_factor=0)
+                return real_dream_consolidate(
+                    backend,
+                    tasks,
+                    skill,
+                    memory,
+                    **safe,
+                )
+
+            with mock.patch(
+                "skillopt_sleep.cycle.dream_consolidate",
+                side_effect=_spy,
+            ):
+                run_sleep_cycle(cfg, seed_tasks=tonight)
+
+            self.assertEqual(len(calls), 3)
+            aggregate = calls[0]
+            group_calls = calls[1:]
+            self.assertEqual(
+                aggregate["hints"],
+                {"research-skill", "programming-skill"},
+            )
+            self.assertTrue(aggregate["kwargs"]["evolve_memory"])
+            self.assertEqual(
+                {
+                    task.skill_hint
+                    for task in aggregate["kwargs"]["history_tasks"]
+                },
+                {"research-skill", "programming-skill"},
+            )
+
+            expected = {
+                "recall_k": 7,
+                "dream_rollouts": 3,
+                "dream_factor": 2,
+                "edit_budget": 6,
+                "gate_metric": "mixed",
+                "gate_mixed_weight": 0.37,
+                "gate_no_regression": True,
+                "gate_mode": "off",
+                "evolve_skill": True,
+            }
+            self.assertEqual(
+                {next(iter(call["hints"])) for call in group_calls},
+                {"research-skill", "programming-skill"},
+            )
+            for call in group_calls:
+                kwargs = call["kwargs"]
+                for key, value in expected.items():
+                    self.assertEqual(kwargs[key], value, key)
+                self.assertFalse(kwargs["evolve_memory"])
+                hint = next(iter(call["hints"]))
+                self.assertEqual(
+                    {task.skill_hint for task in kwargs["history_tasks"]},
+                    {hint},
+                )
+
+    def test_managed_and_fanout_proposals_never_target_the_same_live_file(self):
+        from skillopt_sleep.staging import staged_skills
+
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            research_live = os.path.join(
+                claude_home,
+                "skills",
+                "research-skill",
+                "SKILL.md",
+            )
+            programming_live = os.path.join(
+                claude_home,
+                "skills",
+                "programming-skill",
+                "SKILL.md",
+            )
+            os.makedirs(os.path.dirname(research_live), exist_ok=True)
+            os.makedirs(os.path.dirname(programming_live), exist_ok=True)
+            with open(research_live, "w", encoding="utf-8") as handle:
+                handle.write("# research baseline\n")
+            with open(programming_live, "w", encoding="utf-8") as handle:
+                handle.write("# programming baseline\n")
+            cfg = load_config(
+                invoked_project=proj,
+                projects="invoked",
+                backend="mock",
+                claude_home=claude_home,
+                target_skill_path=research_live,
+                managed_skill_name="skillopt-sleep-learned",
+                auto_adopt=False,
+                multi_skill_report=True,
+                gate_mode="off",
+            )
+
+            outcome = run_sleep_cycle(cfg, seed_tasks=self._hinted_tasks())
+
+            self.assertEqual(
+                [row["skill_name"] for row in staged_skills(outcome.staging_dir)],
+                ["programming-skill"],
+            )
+            self.assertTrue(any(
+                "research-skill" in note
+                and "same live target as the managed skill" in note
+                for note in outcome.report.notes
+            ))
+            with open(
+                os.path.join(outcome.staging_dir, "manifest.json"),
+                encoding="utf-8",
+            ) as handle:
+                manifest = json.load(handle)
+            self.assertFalse(manifest["has_skill"])
+            self.assertTrue(manifest["has_managed_skill"])
+            self.assertEqual(
+                manifest["legacy"]["skill"]["live_realpath"],
+                os.path.realpath(research_live),
+            )
+
+    def test_single_contained_symlink_alias_is_reported_but_not_staged(self):
+        from dataclasses import replace
+
+        from skillopt_sleep.staging import staged_skills
+
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            skills_root = os.path.join(claude_home, "skills")
+            real_dir = os.path.join(skills_root, "real-skill")
+            alias_dir = os.path.join(skills_root, "alias-skill")
+            os.makedirs(real_dir, exist_ok=True)
+            with open(
+                os.path.join(real_dir, "SKILL.md"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("# real baseline\n")
+            try:
+                os.symlink(real_dir, alias_dir)
+            except OSError:
+                self.skipTest("symlinks unavailable")
+            tasks = [
+                replace(task, skill_hint="alias-skill")
+                for task in assign_splits(
+                    researcher_persona(),
+                    holdout_fraction=0.34,
+                    seed=42,
+                )
+            ]
+            cfg = load_config(
+                invoked_project=proj,
+                projects="invoked",
+                backend="mock",
+                claude_home=claude_home,
+                managed_skill_name="skillopt-sleep-learned",
+                auto_adopt=False,
+                multi_skill_report=True,
+                gate_mode="off",
+            )
+
+            outcome = run_sleep_cycle(cfg, seed_tasks=tasks)
+
+            self.assertEqual(staged_skills(outcome.staging_dir), [])
+            self.assertTrue(any(
+                "alias-skill" in note
+                and "is not alias-skill/SKILL.md" in note
+                for note in outcome.report.notes
+            ))
+            with open(
+                os.path.join(outcome.staging_dir, "report.md"),
+                encoding="utf-8",
+            ) as handle:
+                self.assertIn("alias-skill", handle.read())
+
+    def test_group_control_flow_exceptions_never_publish_or_advance_a_night(self):
+        from skillopt_sleep.backend import CursorBackendError
+        from skillopt_sleep.handoff_backend import PendingCalls
+        from skillopt_sleep.staging import latest_staging
+
+        cases = (
+            PendingCalls({"group-call": {"prompt": "continue", "max_tokens": 20}}),
+            CursorBackendError("group backend authentication failed"),
+        )
+        for failure in cases:
+            with self.subTest(failure=type(failure).__name__), (
+                tempfile.TemporaryDirectory()
+            ) as proj, tempfile.TemporaryDirectory() as home:
+                claude_home = os.path.join(home, ".claude")
+                self._write_live_skills(
+                    claude_home,
+                    "research-skill",
+                    "programming-skill",
+                )
+                cfg = load_config(
+                    invoked_project=proj,
+                    projects="invoked",
+                    backend="mock",
+                    claude_home=claude_home,
+                    managed_skill_name="skillopt-sleep-learned",
+                    auto_adopt=False,
+                    multi_skill_report=True,
+                )
+
+                with mock.patch(
+                    "skillopt_sleep.cycle.consolidate_groups",
+                    side_effect=failure,
+                ), self.assertRaises(type(failure)):
+                    run_sleep_cycle(cfg, seed_tasks=self._hinted_tasks())
+
+                self.assertIsNone(latest_staging(proj))
+                self.assertFalse(os.path.exists(cfg.state_path))

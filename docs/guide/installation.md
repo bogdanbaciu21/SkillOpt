@@ -28,8 +28,9 @@ checkout for those files.
     The generic research `openai_compatible` backend, SkillOpt-Sleep handoff,
     Sleep support for non-Azure OpenAI-compatible endpoints, the Sleep
     `--preferences` flag, Cursor source/backend/plugin support, and Pi
-    source/backend support landed after that release and require a source
-    install from `main` until the next release.
+    source/backend support, multi-skill fan-out, and reviewed subset adoption
+    landed after that release and require a source install from `main` until
+    the next release.
 
 ### Source checkout
 

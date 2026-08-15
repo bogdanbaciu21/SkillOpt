@@ -147,6 +147,35 @@ class TestConsolidateGroups(unittest.TestCase):
         self.assertEqual(outcomes["research-skill"].status, CONSOLIDATED)
         self.assertTrue(outcomes["research-skill"].accepted)
 
+    def test_pending_handoff_calls_propagate_instead_of_becoming_failed_rows(self):
+        from skillopt_sleep.handoff_backend import PendingCalls
+
+        pending = {"prompt-id": {"prompt": "answer me", "max_tokens": 20}}
+
+        def _pending(*args, **kwargs):
+            raise PendingCalls(pending)
+
+        with self.assertRaises(PendingCalls) as caught:
+            consolidate_groups(
+                MockBackend(),
+                [SkillGroup("research-skill", "# research\n", _tasks(researcher_persona))],
+                consolidate_fn=_pending,
+            )
+        self.assertEqual(caught.exception.pending, pending)
+
+    def test_fatal_cursor_error_propagates_instead_of_becoming_a_failed_row(self):
+        from skillopt_sleep.backend import CursorBackendError
+
+        def _fatal(*args, **kwargs):
+            raise CursorBackendError("authentication failed")
+
+        with self.assertRaises(CursorBackendError):
+            consolidate_groups(
+                MockBackend(),
+                [SkillGroup("research-skill", "# research\n", _tasks(researcher_persona))],
+                consolidate_fn=_fatal,
+            )
+
     def test_group_runs_do_not_evolve_shared_memory(self):
         seen = {}
 
@@ -177,6 +206,72 @@ class TestConsolidateGroups(unittest.TestCase):
         )
         self.assertEqual(outcomes["research-skill"].status, CONSOLIDATED)
         self.assertFalse(seen["evolve_memory"])
+
+    def test_group_specific_dream_kwargs_preserve_skill_boundaries(self):
+        seen = {}
+
+        def _fake(backend, tasks, skill, memory, **kwargs):
+            seen[skill] = kwargs.pop("history_tasks")
+            return consolidate(backend, tasks, skill, memory, **kwargs)
+
+        histories = {
+            "# research\n": ["research-history"],
+            "# programming\n": ["programming-history"],
+        }
+        outcomes = consolidate_groups(
+            MockBackend(),
+            [
+                SkillGroup("research-skill", "# research\n", _tasks(researcher_persona)),
+                SkillGroup(
+                    "programming-skill",
+                    "# programming\n",
+                    _tasks(programmer_persona, seed=1),
+                ),
+            ],
+            consolidate_fn=_fake,
+            group_kwargs_fn=lambda group: {
+                "history_tasks": histories[group.skill]
+            },
+            edit_budget=4,
+            night=1,
+        )
+        self.assertEqual(seen, histories)
+        self.assertEqual(outcomes["research-skill"].status, CONSOLIDATED)
+        self.assertEqual(outcomes["programming-skill"].status, CONSOLIDATED)
+
+    def test_group_kwargs_failure_is_isolated_like_a_group_backend_failure(self):
+        calls = []
+
+        def _kwargs(group):
+            if group.skill_name == "broken-skill":
+                raise ValueError("invalid recalled history")
+            return {"history_tasks": []}
+
+        def _fake(backend, tasks, skill, memory, **kwargs):
+            calls.append(skill)
+            kwargs.pop("history_tasks")
+            return consolidate(backend, tasks, skill, memory, **kwargs)
+
+        outcomes = consolidate_groups(
+            MockBackend(),
+            [
+                SkillGroup("broken-skill", "# broken\n", _tasks(researcher_persona)),
+                SkillGroup(
+                    "research-skill",
+                    set_learned("", []),
+                    _tasks(researcher_persona),
+                ),
+            ],
+            consolidate_fn=_fake,
+            group_kwargs_fn=_kwargs,
+            edit_budget=4,
+            night=1,
+        )
+
+        self.assertEqual(outcomes["broken-skill"].status, FAILED)
+        self.assertIn("ValueError: invalid recalled history", outcomes["broken-skill"].reason)
+        self.assertEqual(outcomes["research-skill"].status, CONSOLIDATED)
+        self.assertEqual(len(calls), 1)
 
     def test_accepted_group_skills_lists_only_accepted_updates(self):
         outcomes = {

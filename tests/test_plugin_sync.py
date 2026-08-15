@@ -18,7 +18,10 @@ PLUGIN_SKILL_MDS = {
 }
 
 MCP_SERVER = os.path.join(REPO, "plugins/copilot/mcp_server.py")
+COPILOT_README = os.path.join(REPO, "plugins/copilot/README.md")
 COPILOT_INSTRUCTIONS = os.path.join(REPO, "plugins/copilot/copilot-instructions.snippet.md")
+DEVIN_README = os.path.join(REPO, "plugins/devin/README.md")
+DEVIN_RULES = os.path.join(REPO, "plugins/devin/devin-rules.snippet.md")
 
 CANONICAL_BACKENDS = {"mock", "claude", "codex", "copilot"}
 CURSOR_MANIFEST = os.path.join(REPO, "plugins/cursor/.cursor-plugin/plugin.json")
@@ -184,9 +187,23 @@ assert backend.name == "mock", backend.name
     def test_mcp_schema_has_key_params(self):
         text = _read(MCP_SERVER)
         for param in ["source", "tasks_file", "target_skill_path",
+                       "staging", "skills", "all_skills", "legacy",
                        "max_sessions", "max_tasks", "auto_adopt", "json"]:
             self.assertIn(f'"{param}"', text,
                           f"MCP schema missing param '{param}'")
+
+    def test_mcp_adoption_docs_cover_fanout_selection(self):
+        for path in (COPILOT_README, COPILOT_INSTRUCTIONS, DEVIN_README, DEVIN_RULES):
+            text = _read(path)
+            for param in ("staging", "skills", "all_skills", "legacy"):
+                self.assertIn(f"`{param}`", text, f"{path} missing `{param}`")
+
+    def test_devin_docs_disclaim_post_adoption_copy(self):
+        for path in (DEVIN_README, DEVIN_RULES):
+            text = _read(path).lower()
+            self.assertIn("no post-adoption copy", text)
+            self.assertIn("target_skill_path", text)
+            self.assertIn("core engine", text)
 
     def test_all_skill_mds_mention_memory_consolidation(self):
         for name, path in PLUGIN_SKILL_MDS.items():

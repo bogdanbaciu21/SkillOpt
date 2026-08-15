@@ -92,8 +92,9 @@ pip install skillopt        # installs the engine + the `skillopt-sleep` command
 skillopt-sleep dry-run      # harvest + mine + replay, report only; stages nothing
 skillopt-sleep run          # a full nightly cycle; the proposal is staged for review
 skillopt-sleep status       # show state + the latest staged proposal
-skillopt-sleep adopt        # apply the latest staged proposal
+skillopt-sleep adopt --legacy       # apply a reviewed managed proposal
 skillopt-sleep adopt --skill NAME   # adopt one staged skill (repeatable)
+skillopt-sleep adopt --all-skills   # adopt every still-pending fan-out skill
 skillopt-sleep schedule     # install a nightly cron entry for this project
 ```
 
@@ -101,8 +102,8 @@ skillopt-sleep schedule     # install a nightly cron entry for this project
 > commands above. Cursor source/backend/plugin support, VS Code Copilot
 > transcript harvesting, Pi source/backend support, Sleep handoff, non-Azure
 > OpenAI-compatible endpoints, OpenCode Sleep source/backend support, and
-> `--preferences` landed later and require a source install from `main` until
-> the next release.
+> `--preferences`, multi-skill fan-out, and reviewed subset adoption landed
+> later and require a source install from `main` until the next release.
 
 The per-agent integrations below still come from the repo; the CLI above is the
 standalone, pip-only way to run a cycle. Claude Code, Codex, Cursor, Copilot, and
@@ -279,25 +280,38 @@ documents the separate HTTPS-only boundary for Azure managed-identity credential
 Deterministic proof (no API key):
 `python -m skillopt_sleep.experiments.run_experiment --persona researcher --assert-improves`.
 
-### Opt-in: per-skill group reporting
+### Opt-in: per-skill fan-out
 
-Set `"multi_skill_report": true` in `~/.skillopt-sleep/config.json` to add an
-independent gate result and report row for every explicit skill hint mined that
-night:
+Set `"multi_skill_fanout": true` in `~/.skillopt-sleep/config.json` to add an
+independent gate result and reviewable proposal for every explicit skill hint
+mined that night. `multi_skill_report` remains a compatibility alias:
 
 ```json
-{"multi_skill_report": true}
+{"multi_skill_fanout": true}
 ```
 
 This runs one additional consolidation per group (including a catch-all group when
-hinted and unhinted evidence are mixed), so it increases backend calls and token use.
+hinted and unhinted evidence are mixed), so it multiplies backend calls and token
+use; configured dream rollouts and synthetic variants multiply the per-group work
+too. Each group inherits the configured edit budget, gate mode/metric,
+`gate_no_regression`, `dream_rollouts`, `dream_factor`, `recall_k`, and
+`evolve_skill`. Recalled archive tasks are restricted to that same skill hint;
+shared memory is read-only in fan-out runs. Setting `evolve_skill` to `false`
+therefore disables per-skill proposals as well as the managed skill proposal.
+
 Each explicitly hinted group resolves and reads its own live `SKILL.md` before
 consolidation, so its staged proposal preserves that skill's baseline. Missing,
-ambiguous, or unreadable skills are skipped and reported instead of falling back to
-the managed document. Adoption remains review-driven: choose proposals with
-`adopt --skill NAME` or `--all-skills`; `auto_adopt` never promotes the per-skill
-fan-out. Nights containing only the managed catch-all group keep the existing
-single-consolidation behavior.
+ambiguous, unreadable, aliased, or colliding skills are skipped and reported
+instead of falling back to the managed document. Adoption remains review-driven:
+choose fan-out proposals with `adopt --skill NAME` or `--all-skills`, and use
+`adopt --legacy` for a co-staged managed skill/memory pair. `auto_adopt` never
+promotes the per-skill fan-out. Nights containing only the managed catch-all group
+keep the existing single-consolidation behavior.
+
+Resolution searches existing project-native `.agents/skills`, `.claude/skills`,
+`.cursor/skills`, and `.devin/skills` directories, then the established Claude
+home and plugin-cache roots. Add repeatable `--skill-root PATH` values when an
+integration stores skills elsewhere. Relative roots resolve below `--project`.
 
 ### Opt-in: experience replay & dream rollouts
 

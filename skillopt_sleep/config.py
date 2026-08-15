@@ -74,12 +74,16 @@ DEFAULTS: Dict[str, Any] = {
     "evolve_skill": True,         # consolidate the managed SKILL.md
     "llm_mine": True,             # use the backend to mine checkable tasks (real backends)
     "target_skill_path": "",      # explicit SKILL.md target for repo-scoped agents
+    "skill_roots": [],            # extra explicit roots containing <name>/SKILL.md
     "target_task_filter": True,   # prefer mined tasks matching target_skill_path/text
     "progress": False,            # print phase progress to stderr
     # ── observability ──────────────────────────────────────────────────────
     "evidence_log": True,         # write per-night evidence.jsonl (full evidentiary chain)
     "evidence_max_chars": 4000,   # per-field truncation cap for evidence events
-    "multi_skill_report": False,  # extra consolidation/report row per routed skill group
+    # ``multi_skill_report`` is the compatibility alias used before fan-out
+    # began staging independently adoptable proposals.
+    "multi_skill_fanout": None,
+    "multi_skill_report": False,
     # ── adoption / safety ──────────────────────────────────────────────────
     "auto_adopt": False,          # default: stage + require explicit `adopt`
     "managed_skill_name": "skillopt-sleep-learned",

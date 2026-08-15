@@ -9,12 +9,15 @@ CI use. With backend="anthropic" it spends the user's budget for real lift.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import os
+import re
 import shutil
 import sys
+import unicodedata
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from skillopt_sleep import evidence
 from skillopt_sleep.backend import Backend, CursorBackendError, build_backend
@@ -44,6 +47,10 @@ from skillopt_sleep.staging import (
 from skillopt_sleep.staging import adopt as adopt_staging
 from skillopt_sleep.state import SleepState, _now_iso
 from skillopt_sleep.types import SessionDigest, SleepReport, TaskRecord
+
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-_])"
+)
 
 
 # ── Model-swap detection (F16) ───────────────────────────────
@@ -158,6 +165,33 @@ def _read(path: str) -> str:
         return ""
 
 
+def _read_live_baseline(path: str, label: str) -> tuple[str, str, str]:
+    """Read one live document once and pin the exact bytes and target identity.
+
+    A missing file is a valid empty baseline. Other I/O failures and invalid
+    UTF-8 are not: silently treating either as an empty document could derive a
+    proposal from a scaffold and later overwrite data the cycle never read.
+    """
+    realpath = os.path.realpath(os.path.abspath(path))
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return "", "", realpath
+    except OSError as exc:
+        raise StagingError(
+            f"could not read live {label} baseline {path!r}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as exc:
+        raise StagingError(
+            f"live {label} baseline is not valid UTF-8: {path!r}"
+        ) from exc
+    return text, hashlib.sha256(raw).hexdigest(), realpath
+
+
 def _progress(cfg: SleepConfig, message: str) -> None:
     if cfg.get("progress", False):
         print(f"[sleep] {message}", file=sys.stderr, flush=True)
@@ -177,9 +211,27 @@ def _discard_unstaged_evidence(path: str) -> None:
             break
 
 
+def _multi_skill_fanout_enabled(cfg: SleepConfig) -> bool:
+    """Prefer the behavior-named flag while preserving the original alias."""
+    explicit = cfg.get("multi_skill_fanout")
+    if explicit is not None:
+        return bool(explicit)
+    return bool(cfg.get("multi_skill_report", False))
+
+
+def _one_line_display_text(value: object) -> str:
+    """Remove terminal controls and fold untrusted text onto one line."""
+    without_ansi = _ANSI_ESCAPE_RE.sub("", str(value))
+    without_controls = "".join(
+        " " if unicodedata.category(ch) in {"Cc", "Cf"} else ch
+        for ch in without_ansi
+    )
+    return " ".join(without_controls.split())
+
+
 def _markdown_table_text(value: object) -> str:
     """Keep untrusted evidence text inside one readable Markdown table cell."""
-    text = " ".join(str(value).splitlines())
+    text = _one_line_display_text(value)
     return (
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -187,6 +239,14 @@ def _markdown_table_text(value: object) -> str:
         .replace("|", "&#124;")
         .replace("`", "&#96;")
     )
+
+
+def _markdown_text(value: object) -> str:
+    """Render untrusted text literally in ordinary Markdown prose."""
+    text = _markdown_table_text(value)
+    for token in ("\\", "*", "_", "[", "]", "(", ")", "#", "+", "!", "{"):
+        text = text.replace(token, "\\" + token)
+    return text.replace("}", "\\}")
 
 
 def _report_score(value: object) -> str:
@@ -201,16 +261,20 @@ def _report_score(value: object) -> str:
 
 
 def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
+    project = _markdown_text(report.project)
+    backend = _markdown_text(cfg.get("backend"))
+    replay = _markdown_text(cfg.get("replay_mode"))
+    gate_action = _markdown_text(report.gate_action)
     lines = [
         f"# SkillOpt-Sleep — night {report.night} report",
         "",
-        f"- project: `{report.project}`",
-        f"- backend: `{cfg.get('backend')}`  replay: `{cfg.get('replay_mode')}`",
+        f"- project: `{project}`",
+        f"- backend: `{backend}`  replay: `{replay}`",
         f"- sessions harvested: {report.n_sessions}",
         f"- tasks mined: {report.n_tasks}  (replayed: {report.n_replayed})",
         f"- held-out score: {_report_score(report.baseline_score)} "
         f"-> {_report_score(report.candidate_score)}",
-        f"- gate: **{report.gate_action}** (accepted={report.accepted})",
+        f"- gate: **{gate_action}** (accepted={bool(report.accepted)})",
         f"- no-regression gate: "
         f"{'enabled' if cfg.get('gate_no_regression', False) else 'disabled'}",
         f"- tokens used: {report.tokens_used}",
@@ -268,7 +332,13 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
     if report.edits:
         lines.append("## Accepted edits")
         for e in report.edits:
-            lines.append(f"- [{e.target}/{e.op}] {e.content}  \n  _why: {e.rationale}_")
+            target = _markdown_text(e.target)
+            op = _markdown_text(e.op)
+            content = _markdown_text(e.content)
+            rationale = _markdown_text(e.rationale)
+            lines.append(
+                f"- \\[{target}/{op}\\] {content}  \n  _why: {rationale}_"
+            )
         lines.append("")
     if report.rejected_edits:
         # On a leaked-holdout night the gate abstained rather than rejecting, so
@@ -278,7 +348,10 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
         else:
             lines.append("## Rejected by gate (kept as negative feedback)")
         for e in report.rejected_edits:
-            lines.append(f"- [{e.target}/{e.op}] {e.content}")
+            target = _markdown_text(e.target)
+            op = _markdown_text(e.op)
+            content = _markdown_text(e.content)
+            lines.append(f"- \\[{target}/{op}\\] {content}")
         lines.append("")
     if report.unmatched_edits:
         lines.append("## Proposed but changed nothing (never reached the gate)")
@@ -287,8 +360,15 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
             "add, or an unknown op. "
             "These were never scored — check the anchor text if a rule you expected is missing._")
         for e in report.unmatched_edits:
-            anchor = f"  \n  _anchor: `{e.anchor}`_" if e.anchor else ""
-            lines.append(f"- [{e.target}/{e.op}] {e.content}{anchor}")
+            target = _markdown_text(e.target)
+            op = _markdown_text(e.op)
+            content = _markdown_text(e.content)
+            anchor = (
+                f"  \n  _anchor: `{_markdown_text(e.anchor)}`_"
+                if e.anchor
+                else ""
+            )
+            lines.append(f"- \\[{target}/{op}\\] {content}{anchor}")
         lines.append("")
     if report.skill_groups:
         # The reviewer decides per skill, so the per-skill verdicts belong on
@@ -323,23 +403,29 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
                 scores = "—"
                 edits = "—"
             reason = f" — {_markdown_table_text(g.reason)}" if g.reason else ""
+            group_gate = _markdown_table_text(g.gate_action or "—")
             lines.append(
-                f"| `{name}` | **{decision}**{reason} | {g.gate_action or '—'} "
+                f"| `{name}` | **{decision}**{reason} | {group_gate} "
                 f"| {g.n_tasks} | {scores} | {edits} |")
         lines.append("")
     if report.notes:
         lines.append("## Notes")
         for n in report.notes:
-            lines.append(f"- {n}")
+            lines.append(f"- {_markdown_text(n)}")
         lines.append("")
-    lines.append("_Review, then run `/sleep adopt` to apply, or discard this folder._")
+    lines.append(
+        "_Review the staged artifacts, then use the adoption mode printed by "
+        "the run command (`--skill` / `--all-skills` for fan-out proposals, "
+        "`--legacy` for the managed skill or memory), or discard this folder._"
+    )
     return "\n".join(lines)
 
 
 def _cycle_skip_note(name: str, reason: str) -> str:
     """One-line skip reason for report.notes. Names are untrusted free text."""
     label = str(name or "").strip() or "<unnamed>"
-    return redact_secrets(f"cycle skipped skill {label}: {reason}")
+    redacted = str(redact_secrets(f"cycle skipped skill {label}: {reason}"))
+    return _one_line_display_text(redacted)
 
 
 def _skill_groups_from_live_baselines(
@@ -350,6 +436,7 @@ def _skill_groups_from_live_baselines(
 ) -> tuple[
     List[SkillGroup],
     dict[str, GroupConsolidation],
+    dict[str, str],
     dict[str, str],
     List[str],
 ]:
@@ -365,6 +452,7 @@ def _skill_groups_from_live_baselines(
     groups: List[SkillGroup] = []
     skipped: dict[str, GroupConsolidation] = {}
     live_paths: dict[str, str] = {}
+    live_hashes: dict[str, str] = {}
     notes: List[str] = []
     for raw_name, rows in grouped.items():
         name = str(raw_name or "").strip()
@@ -384,8 +472,9 @@ def _skill_groups_from_live_baselines(
             notes.append(_cycle_skip_note(name, reason))
             continue
         try:
-            with open(resolution.path, encoding="utf-8") as handle:
-                live_skill = handle.read()
+            with open(resolution.path, "rb") as handle:
+                live_bytes = handle.read()
+            live_skill = live_bytes.decode("utf-8")
         except (OSError, UnicodeError) as exc:
             reason = f"could not read resolved SKILL.md ({type(exc).__name__})"
             skipped[name] = GroupConsolidation(
@@ -399,7 +488,8 @@ def _skill_groups_from_live_baselines(
 
         groups.append(SkillGroup(name, live_skill, rows))
         live_paths[name] = resolution.path
-    return groups, skipped, live_paths, notes
+        live_hashes[name] = hashlib.sha256(live_bytes).hexdigest()
+    return groups, skipped, live_paths, live_hashes, notes
 
 
 def _skill_proposals_from_groups(
@@ -407,6 +497,8 @@ def _skill_proposals_from_groups(
     group_outcomes: dict,
     managed_name: str,
     resolved_paths: Optional[dict[str, str]] = None,
+    resolved_hashes: Optional[dict[str, str]] = None,
+    reserved_live_paths: Sequence[str] = (),
 ) -> tuple[List[SkillProposal], List[str]]:
     """Stage per-skill proposals for accepted groups whose names resolve uniquely.
 
@@ -420,6 +512,11 @@ def _skill_proposals_from_groups(
     roots = skill_search_roots(cfg)
     proposals: List[SkillProposal] = []
     notes: List[str] = []
+    reserved_keys = {
+        unicodedata.normalize("NFC", os.path.realpath(path)).casefold()
+        for path in reserved_live_paths
+        if path
+    }
     for name, new_skill in accepted_group_skills(group_outcomes).items():
         if name == managed_name:
             continue
@@ -431,6 +528,14 @@ def _skill_proposals_from_groups(
             if not live_path:
                 notes.append(_cycle_skip_note(name, "no resolved live baseline"))
                 continue
+            live_sha256 = (
+                resolved_hashes.get(name, "")
+                if resolved_hashes is not None
+                else None
+            )
+            if resolved_hashes is not None and not live_sha256:
+                notes.append(_cycle_skip_note(name, "no hashed live baseline"))
+                continue
         else:
             resolution = resolve_skill(name, roots)
             if not resolution.ok:
@@ -439,7 +544,25 @@ def _skill_proposals_from_groups(
                 )
                 continue
             live_path = resolution.path
-        candidate = SkillProposal(name, new_skill, live_path)
+            live_sha256 = None
+        live_key = unicodedata.normalize(
+            "NFC", os.path.realpath(live_path)
+        ).casefold()
+        if live_key in reserved_keys:
+            notes.append(
+                _cycle_skip_note(
+                    name,
+                    "same live target as the managed skill proposal",
+                )
+            )
+            continue
+        candidate = SkillProposal(
+            name,
+            new_skill,
+            live_path,
+            live_sha256=live_sha256,
+            live_realpath=live_path,
+        )
         try:
             skill_proposal_rows(proposals + [candidate])
         except StagingError as exc:
@@ -447,6 +570,19 @@ def _skill_proposals_from_groups(
             continue
         proposals.append(candidate)
     return proposals, notes
+
+
+def _history_for_skill_group(
+    history_tasks: List[TaskRecord],
+    skill_name: str,
+    managed_name: str,
+) -> List[TaskRecord]:
+    """Keep recalled evidence inside the same routed skill boundary."""
+    return [
+        task
+        for task in history_tasks
+        if (str(task.skill_hint or "").strip() or managed_name) == skill_name
+    ]
 
 
 def run_sleep_cycle(
@@ -531,9 +667,17 @@ def run_sleep_cycle(
     live_memory_path = os.path.join(project, "CLAUDE.md")
     live_skill_path = cfg.managed_skill_path()
     _progress(cfg, f"live skill: {live_skill_path}")
-    raw_skill = _read(live_skill_path)
+    (
+        raw_skill,
+        live_skill_sha256,
+        live_skill_realpath,
+    ) = _read_live_baseline(live_skill_path, "skill")
     skill = raw_skill
-    memory = _read(live_memory_path)
+    (
+        memory,
+        live_memory_sha256,
+        live_memory_realpath,
+    ) = _read_live_baseline(live_memory_path, "memory")
     if not skill:
         skill = ensure_skill_scaffold(
             "", name=cfg.get("managed_skill_name", "skillopt-sleep-learned"),
@@ -714,29 +858,50 @@ def run_sleep_cycle(
     #
     group_outcomes = {}
     group_live_paths: dict[str, str] = {}
+    group_live_hashes: dict[str, str] = {}
     managed_name = cfg.get("managed_skill_name", "skillopt-sleep-learned")
-    if cfg.get("multi_skill_report", False):
+    if _multi_skill_fanout_enabled(cfg):
         grouped = group_tasks_by_skill_hint(tasks, managed_name)
         only_catch_all = len(grouped) == 1 and managed_name in grouped
         if grouped and not only_catch_all:
             _progress(cfg, f"multi-skill report: groups={len(grouped)}")
-            live_groups, skipped_groups, group_live_paths, skip_notes = (
-                _skill_groups_from_live_baselines(
-                    cfg, grouped, managed_name, skill
-                )
+            (
+                live_groups,
+                skipped_groups,
+                group_live_paths,
+                group_live_hashes,
+                skip_notes,
+            ) = _skill_groups_from_live_baselines(
+                cfg, grouped, managed_name, skill
             )
             report.notes.extend(skip_notes)
-            consolidated_groups = consolidate_groups(
-                backend,
-                live_groups,
-                memory,
-                edit_budget=cfg.get("edit_budget", 4),
-                gate_metric=cfg.get("gate_metric", "mixed"),
-                gate_mixed_weight=cfg.get("gate_mixed_weight", 0.5),
-                gate_no_regression=cfg.get("gate_no_regression", False),
-                gate_mode=cfg.get("gate_mode", "on"),
-                night=night,
-            )
+            try:
+                consolidated_groups = consolidate_groups(
+                    backend,
+                    live_groups,
+                    memory,
+                    consolidate_fn=dream_consolidate,
+                    group_kwargs_fn=lambda group: {
+                        "history_tasks": _history_for_skill_group(
+                            history_tasks,
+                            group.skill_name,
+                            managed_name,
+                        )
+                    },
+                    recall_k=recall_k,
+                    dream_rollouts=int(cfg.get("dream_rollouts", 1) or 1),
+                    dream_factor=int(cfg.get("dream_factor", 0) or 0),
+                    edit_budget=cfg.get("edit_budget", 4),
+                    gate_metric=cfg.get("gate_metric", "mixed"),
+                    gate_mixed_weight=cfg.get("gate_mixed_weight", 0.5),
+                    gate_no_regression=cfg.get("gate_no_regression", False),
+                    gate_mode=cfg.get("gate_mode", "on"),
+                    evolve_skill=cfg.get("evolve_skill", True),
+                    night=night,
+                )
+            except CursorBackendError:
+                _discard_unstaged_evidence(staging_dir_pre)
+                raise
             for raw_name in grouped:
                 name = str(raw_name or "").strip()
                 outcome = skipped_groups.get(name) or consolidated_groups.get(name)
@@ -764,7 +929,12 @@ def run_sleep_cycle(
         proposed_skill = result.new_skill if (cfg.get("evolve_skill") and result.accepted) else None
         proposed_memory = result.new_memory if (cfg.get("evolve_memory") and result.accepted) else None
         skill_proposals, skip_notes = _skill_proposals_from_groups(
-            cfg, group_outcomes, managed_name, group_live_paths
+            cfg,
+            group_outcomes,
+            managed_name,
+            group_live_paths,
+            group_live_hashes,
+            [live_skill_path] if proposed_skill is not None else [],
         )
         report.notes.extend(skip_notes)
         report_md = _render_report_md(report, cfg)
@@ -775,6 +945,10 @@ def run_sleep_cycle(
             proposed_memory=proposed_memory,
             live_skill_path=live_skill_path,
             live_memory_path=live_memory_path,
+            live_skill_sha256=live_skill_sha256,
+            live_memory_sha256=live_memory_sha256,
+            live_skill_realpath=live_skill_realpath,
+            live_memory_realpath=live_memory_realpath,
             report_md=report_md,
             out_dir=staging_dir_pre,
             skill_proposals=skill_proposals,

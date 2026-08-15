@@ -118,32 +118,72 @@ def _plugin_skills_root(plugin_dir: str) -> str:
 
 
 def skill_search_roots(cfg: object) -> List[str]:
-    """Documented local skill roots for a config: user skills, then plugin cache.
+    """Return every configured native skill root in deterministic order.
 
-    ``<claude_home>/skills`` holds hand-written skills. Installed Claude Code
-    plugins expose theirs under the plugin cache, in either the versioned
-    marketplace layout ``plugins/cache/<marketplace>/<plugin>/<version>/skills``
-    or the legacy ``plugins/cache/<marketplace>/<plugin>/skills``. At most one
-    root per installed plugin is returned, in that fixed precedence order.
+    The resolver supports project-native Claude/Codex/Cursor/Devin layouts,
+    configured user homes, explicit extra roots, and installed Claude plugins.
+    Returning all matches is intentional: ``resolve_skill`` refuses ambiguity
+    instead of silently choosing one agent's file over another.
     """
-    configured = str(getattr(cfg, "claude_home", "") or "").strip()
-    if not configured:
-        # Guard before abspath: os.path.abspath("") is the CWD, which would
-        # silently search a tree well outside the documented ~/.claude root.
-        return []
-    claude_home = os.path.abspath(os.path.expanduser(configured))
-    roots = [os.path.join(claude_home, "skills")]
+    roots: List[str] = []
 
-    cache = os.path.join(claude_home, "plugins", "cache")
-    for marketplace in _listdir(cache):
-        plugins_dir = os.path.join(cache, marketplace)
-        if not os.path.isdir(plugins_dir):
+    invoked_project = str(getattr(cfg, "invoked_project", "") or "").strip()
+    if invoked_project:
+        project = os.path.abspath(os.path.expanduser(invoked_project))
+        roots.extend(
+            os.path.join(project, relative)
+            for relative in (
+                os.path.join(".agents", "skills"),
+                os.path.join(".claude", "skills"),
+                os.path.join(".cursor", "skills"),
+                os.path.join(".devin", "skills"),
+            )
+        )
+
+    # Keep the established user-level Claude root. Other agents' user-level
+    # layouts are not sufficiently standardized; callers can add them through
+    # ``skill_roots`` without silently creating cross-agent ambiguity.
+    configured_claude = str(getattr(cfg, "claude_home", "") or "").strip()
+    if configured_claude:
+        roots.append(
+            os.path.join(
+                os.path.abspath(os.path.expanduser(configured_claude)),
+                "skills",
+            )
+        )
+
+    explicit = getattr(cfg, "skill_roots", ())
+    if isinstance(explicit, (list, tuple)):
+        for value in explicit:
+            if isinstance(value, str) and value.strip():
+                path = os.path.expanduser(value.strip())
+                if not os.path.isabs(path) and invoked_project:
+                    path = os.path.join(invoked_project, path)
+                roots.append(os.path.abspath(path))
+
+    if configured_claude:
+        claude_home = os.path.abspath(os.path.expanduser(configured_claude))
+        cache = os.path.join(claude_home, "plugins", "cache")
+        for marketplace in _listdir(cache):
+            plugins_dir = os.path.join(cache, marketplace)
+            if not os.path.isdir(plugins_dir):
+                continue
+            for plugin in _listdir(plugins_dir):
+                root = _plugin_skills_root(os.path.join(plugins_dir, plugin))
+                if root:
+                    roots.append(root)
+
+    existing: List[str] = []
+    seen = set()
+    for root in roots:
+        if not os.path.isdir(root):
             continue
-        for plugin in _listdir(plugins_dir):
-            root = _plugin_skills_root(os.path.join(plugins_dir, plugin))
-            if root:
-                roots.append(root)
-    return [r for r in roots if os.path.isdir(r)]
+        canonical = os.path.realpath(root)
+        key = os.path.normcase(canonical)
+        if key not in seen:
+            seen.add(key)
+            existing.append(canonical)
+    return existing
 
 
 def _contained_skill_file(root: str, name: str) -> str:

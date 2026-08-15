@@ -10,10 +10,14 @@ import json
 import os
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 
 from skillopt_sleep.staging import (
     SkillProposal,
     StagingError,
+    latest_staging,
+    new_staging_dir,
     proposal_filename,
     skill_proposal_rows,
     write_skill_proposals,
@@ -88,6 +92,16 @@ class TestSkillProposalRows(unittest.TestCase):
             skill_proposal_rows([_proposal("alpha", live="/tmp/live/A.md"),
                                  _proposal("beta", live="/tmp/live/a.md")])
 
+    def test_unicode_equivalent_staged_names_are_refused(self):
+        # HFS+/APFS commonly normalise filenames. NFC ``café`` and the
+        # decomposed NFD spelling must not produce two manifest rows for one
+        # physical staged file.
+        with self.assertRaises(StagingError):
+            skill_proposal_rows([
+                _proposal("café", live="/tmp/live/cafe-a/SKILL.md"),
+                _proposal("cafe\u0301", live="/tmp/live/cafe-b/SKILL.md"),
+            ])
+
     def test_a_generator_of_proposals_still_writes_every_file(self):
         # The annotation says Sequence but nothing enforces it. Validation used
         # to drain a generator, leaving the write loop empty and returning a
@@ -135,7 +149,8 @@ class TestSkillProposalRows(unittest.TestCase):
 
     def test_unsafe_live_paths_are_refused(self):
         for bad in ["", "relative/SKILL.md", "~/skills/a/SKILL.md",
-                    "/tmp/live/../../etc/SKILL.md", "/tmp/live/a/SKILL.txt"]:
+                    "/tmp/live/../../etc/SKILL.md", "/tmp/live/a/SKILL.txt",
+                    "/tmp/live/a/skill\x00/SKILL.md", "/tmp/live/a\n/SKILL.md"]:
             with self.assertRaises(StagingError, msg=bad):
                 skill_proposal_rows([_proposal("alpha", live=bad)])
 
@@ -214,7 +229,52 @@ class TestWriteStagingCompatibility(unittest.TestCase):
             )
             manifest = self._manifest(out)
             self.assertNotIn("skills", manifest)
-            self.assertTrue(manifest["has_skill"])
+            self.assertEqual(manifest["schema"], "skillopt-sleep-staging")
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertFalse(manifest["has_skill"])
+            self.assertFalse(manifest["has_memory"])
+            self.assertTrue(manifest["has_managed_skill"])
+            self.assertTrue(manifest["has_managed_memory"])
+
+    def test_v020_compatibility_flags_select_no_unpinned_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = write_staging(
+                tmp, report=_report(), proposed_skill="# skill\n",
+                proposed_memory="# memory\n",
+                live_skill_path=os.path.join(tmp, "live", "SKILL.md"),
+                live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                report_md="# report\n",
+            )
+            manifest = self._manifest(out)
+            # This is the complete v0.2.0 mutation decision: it trusted only
+            # these top-level booleans, without consulting integrity pins.
+            selected = []
+            if manifest.get("has_skill"):
+                selected.append("proposed_SKILL.md")
+            if manifest.get("has_memory"):
+                selected.append("proposed_CLAUDE.md")
+            self.assertEqual(selected, [])
+            self.assertIn("skill", manifest["legacy"])
+            self.assertIn("memory", manifest["legacy"])
+
+    def test_unknown_manifest_schema_version_is_refused(self):
+        from skillopt_sleep.staging import staged_skills
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = write_staging(
+                tmp, report=_report(), proposed_skill=None, proposed_memory=None,
+                live_skill_path=os.path.join(tmp, "live", "SKILL.md"),
+                live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                report_md="# report\n",
+                skill_proposals=[_proposal("alpha", root=os.path.join(tmp, "live"))],
+            )
+            path = os.path.join(out, "manifest.json")
+            manifest = self._manifest(out)
+            manifest["schema_version"] = 999
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            with self.assertRaisesRegex(StagingError, "unsupported schema"):
+                staged_skills(out)
 
     def test_fan_out_adds_files_and_manifest_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -242,6 +302,307 @@ class TestWriteStagingCompatibility(unittest.TestCase):
                 rows[0]["sha256"],
                 hashlib.sha256(b"# alpha\n").hexdigest(),
             )
+            self.assertEqual(rows[0]["live_sha256"], "")
+            self.assertEqual(
+                rows[0]["live_realpath"],
+                os.path.realpath(os.path.join(live_root, "alpha", "SKILL.md")),
+            )
+
+    def test_two_same_second_nights_get_distinct_reserved_directories(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "skillopt_sleep.staging._ts_dir", return_value="20260815-010203"
+        ):
+            first = write_staging(
+                tmp, report=_report(), proposed_skill="# first\n",
+                proposed_memory=None,
+                live_skill_path=os.path.join(tmp, "live", "SKILL.md"),
+                live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                report_md="# first report\n",
+            )
+            second = write_staging(
+                tmp, report=_report(), proposed_skill="# second\n",
+                proposed_memory=None,
+                live_skill_path=os.path.join(tmp, "live", "SKILL.md"),
+                live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                report_md="# second report\n",
+            )
+            self.assertNotEqual(first, second)
+            self.assertEqual(
+                sorted((os.path.basename(first), os.path.basename(second))),
+                ["20260815-010203", "20260815-010203-2"],
+            )
+            with open(os.path.join(first, "report.md"), encoding="utf-8") as f:
+                self.assertEqual(f.read(), "# first report\n")
+            with open(os.path.join(second, "report.md"), encoding="utf-8") as f:
+                self.assertEqual(f.read(), "# second report\n")
+
+    def test_concurrent_staging_reservations_are_unique_and_exist(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "skillopt_sleep.staging._ts_dir", return_value="20260815-010203"
+        ):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                paths = list(pool.map(lambda _i: new_staging_dir(tmp), range(16)))
+            self.assertEqual(len(set(paths)), len(paths))
+            self.assertTrue(all(os.path.isdir(path) for path in paths))
+
+    def test_concurrent_publications_leave_one_valid_atomic_latest_pointer(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "skillopt_sleep.staging._ts_dir", return_value="20260815-010203"
+        ):
+            def publish(index):
+                return write_staging(
+                    tmp, report=_report(), proposed_skill=f"# skill {index}\n",
+                    proposed_memory=None,
+                    live_skill_path=os.path.join(tmp, "live", "SKILL.md"),
+                    live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                    report_md=f"# report {index}\n",
+                )
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                paths = list(pool.map(publish, range(16)))
+            latest = latest_staging(tmp)
+            self.assertIn(latest, paths)
+            with open(
+                os.path.join(tmp, ".skillopt-sleep", "staging", ".latest"),
+                encoding="utf-8",
+            ) as handle:
+                self.assertEqual(handle.read().strip(), os.path.basename(latest))
+
+    def test_latest_ignores_a_symlinked_night(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real_night = write_staging(
+                tmp, report=_report(), proposed_skill="# real\n",
+                proposed_memory=None,
+                live_skill_path=os.path.join(tmp, "live", "SKILL.md"),
+                live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                report_md="# real report\n",
+            )
+            outside = os.path.join(tmp, "outside-night")
+            os.makedirs(outside)
+            with open(
+                os.path.join(outside, "manifest.json"), "w", encoding="utf-8"
+            ) as handle:
+                handle.write("{}")
+            alias = os.path.join(
+                os.path.dirname(real_night), "99991231-235959"
+            )
+            try:
+                os.symlink(outside, alias)
+            except OSError:
+                self.skipTest("symlinks unavailable")
+
+            self.assertEqual(latest_staging(tmp), real_night)
+
+    def test_explicit_symlink_staging_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = os.path.join(tmp, "outside-night")
+            os.makedirs(outside)
+            sentinel = os.path.join(outside, "keep.txt")
+            with open(sentinel, "w", encoding="utf-8") as handle:
+                handle.write("untouched\n")
+            alias = os.path.join(tmp, "staging-alias")
+            try:
+                os.symlink(outside, alias)
+            except OSError:
+                self.skipTest("symlinks unavailable")
+
+            with self.assertRaisesRegex(StagingError, "staging directory is unsafe"):
+                write_staging(
+                    tmp, report=_report(), proposed_skill="# proposal\n",
+                    proposed_memory=None,
+                    live_skill_path=os.path.join(tmp, "live", "SKILL.md"),
+                    live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                    report_md="# report\n",
+                    out_dir=alias,
+                )
+            with open(sentinel, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "untouched\n")
+            self.assertEqual(sorted(os.listdir(outside)), ["keep.txt"])
+
+    def test_publication_pointer_orders_equal_mtimes_across_clock_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "skillopt_sleep.staging._ts_dir",
+            side_effect=["20261101-015959", "20261101-010001"],
+        ):
+            before_rollback = write_staging(
+                tmp, report=_report(), proposed_skill="# before\n",
+                proposed_memory=None,
+                live_skill_path=os.path.join(tmp, "live", "SKILL.md"),
+                live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                report_md="# before rollback\n",
+            )
+            after_rollback = write_staging(
+                tmp, report=_report(), proposed_skill="# after\n",
+                proposed_memory=None,
+                live_skill_path=os.path.join(tmp, "live", "SKILL.md"),
+                live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                report_md="# after rollback\n",
+            )
+            os.utime(
+                os.path.join(before_rollback, "manifest.json"),
+                ns=(1_000_000_000, 1_000_000_000),
+            )
+            os.utime(
+                os.path.join(after_rollback, "manifest.json"),
+                ns=(1_000_000_000, 1_000_000_000),
+            )
+
+            self.assertEqual(latest_staging(tmp), after_rollback)
+
+    def test_tampered_symlink_pointer_is_ignored_for_contained_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = write_staging(
+                tmp, report=_report(), proposed_skill="# first\n",
+                proposed_memory=None,
+                live_skill_path=os.path.join(tmp, "live", "SKILL.md"),
+                live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                report_md="# first\n",
+            )
+            pointer = os.path.join(
+                tmp, ".skillopt-sleep", "staging", ".latest"
+            )
+            outside = os.path.join(tmp, "outside-pointer")
+            with open(outside, "w", encoding="utf-8") as handle:
+                handle.write("../../outside-night\n")
+            os.unlink(pointer)
+            try:
+                os.symlink(outside, pointer)
+            except OSError:
+                self.skipTest("symlinks unavailable")
+            self.assertEqual(latest_staging(tmp), first)
+
+    def test_failed_artifact_write_publishes_no_partial_night(self):
+        from skillopt_sleep import staging as staging_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real_write = staging_mod._write_atomic
+
+            def fail_second_proposal(path, text, *, create_parents=True):
+                if path.endswith("proposed_SKILL.beta.md"):
+                    raise OSError("disk full")
+                return real_write(path, text, create_parents=create_parents)
+
+            with mock.patch.object(
+                staging_mod, "_write_atomic", side_effect=fail_second_proposal
+            ), self.assertRaises(OSError):
+                write_staging(
+                    tmp, report=_report(), proposed_skill=None,
+                    proposed_memory=None,
+                    live_skill_path=os.path.join(tmp, "live", "SKILL.md"),
+                    live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                    report_md="# report\n",
+                    skill_proposals=[
+                        _proposal("alpha", "# alpha\n", root=os.path.join(tmp, "live")),
+                        _proposal("beta", "# beta\n", root=os.path.join(tmp, "live")),
+                    ],
+                )
+
+            self.assertIsNone(latest_staging(tmp))
+            for root, _dirs, files in os.walk(tmp):
+                self.assertNotIn("manifest.json", files, root)
+                self.assertFalse(
+                    any(name.startswith("proposed_SKILL") for name in files),
+                    root,
+                )
+
+    def test_artifact_rollback_attempts_every_restore_and_preserves_primary(self):
+        from skillopt_sleep import staging as staging_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, "first.md")
+            second = os.path.join(tmp, "second.md")
+            for path, body in ((first, "old first"), (second, "old second")):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(body)
+            restore_attempts = []
+            real_restore = staging_mod._write_atomic_bytes
+
+            def fail_publish(path, text, *, create_parents=True):
+                if path == second:
+                    raise OSError("primary publish failure")
+
+            def restore(path, data, *, create_parents=True, mode=None):
+                restore_attempts.append(path)
+                if path == first:
+                    raise OSError("first restore failed")
+                return real_restore(
+                    path,
+                    data,
+                    create_parents=create_parents,
+                    mode=mode,
+                )
+
+            with mock.patch.object(
+                staging_mod, "_write_atomic", side_effect=fail_publish
+            ), mock.patch.object(
+                staging_mod, "_write_atomic_bytes", side_effect=restore
+            ):
+                with self.assertRaises(staging_mod.StagingRecoveryError) as caught:
+                    staging_mod._write_artifact_batch([
+                        (first, "new first"),
+                        (second, "new second"),
+                    ])
+            self.assertIsInstance(caught.exception.primary, OSError)
+            self.assertIn("primary publish failure", str(caught.exception.primary))
+            self.assertEqual(restore_attempts, [second, first])
+
+    def test_post_commit_artifact_error_rolls_back_the_whole_night(self):
+        from skillopt_sleep import staging as staging_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real_write = staging_mod._write_atomic
+
+            def commit_then_fail(path, text, *, create_parents=True):
+                result = real_write(path, text, create_parents=create_parents)
+                if path.endswith("proposed_SKILL.beta.md"):
+                    raise OSError("late close failure")
+                return result
+
+            with mock.patch.object(
+                staging_mod, "_write_atomic", side_effect=commit_then_fail
+            ), self.assertRaisesRegex(OSError, "late close failure"):
+                write_staging(
+                    tmp, report=_report(), proposed_skill=None,
+                    proposed_memory=None,
+                    live_skill_path=os.path.join(tmp, "live", "SKILL.md"),
+                    live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                    report_md="# report\n",
+                    skill_proposals=[
+                        _proposal("alpha", "# alpha\n", root=os.path.join(tmp, "live")),
+                        _proposal("beta", "# beta\n", root=os.path.join(tmp, "live")),
+                    ],
+                )
+
+            self.assertIsNone(latest_staging(tmp))
+            for root, _dirs, files in os.walk(tmp):
+                self.assertFalse(files, f"partial staging artifacts remain in {root}")
+
+    def test_exact_cycle_baseline_change_before_staging_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            live = os.path.join(tmp, "live", "alpha", "SKILL.md")
+            os.makedirs(os.path.dirname(live), exist_ok=True)
+            with open(live, "w", encoding="utf-8") as handle:
+                handle.write("# alpha baseline v1\n")
+            proposal = SkillProposal(
+                "alpha",
+                "# alpha proposal derived from v1\n",
+                live,
+                live_sha256=hashlib.sha256(b"# alpha baseline v1\n").hexdigest(),
+                live_realpath=os.path.realpath(live),
+            )
+            with open(live, "w", encoding="utf-8") as handle:
+                handle.write("# alpha human v2\n")
+
+            with self.assertRaisesRegex(StagingError, "changed during consolidation"):
+                write_staging(
+                    tmp, report=_report(), proposed_skill=None,
+                    proposed_memory=None,
+                    live_skill_path=live,
+                    live_memory_path=os.path.join(tmp, "live", "CLAUDE.md"),
+                    report_md="# report\n",
+                    skill_proposals=[proposal],
+                )
+            self.assertIsNone(latest_staging(tmp))
 
     def test_unsafe_fan_out_writes_no_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:

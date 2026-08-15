@@ -5,8 +5,9 @@
 > Sleep support for non-Azure OpenAI-compatible endpoints, the Sleep
 > `--preferences` flag, the research `cursor_exec` target harness, or Cursor
 > source/backend/plugin support, Pi source/backend support, OpenCode Sleep
-> source/backend support, or VS Code Copilot transcript harvesting; use a source
-> install from `main` for those features until the next release.
+> source/backend support, VS Code Copilot transcript harvesting, or multi-skill
+> fan-out and subset adoption; use a source install from `main` for those
+> features until the next release.
 
 ## Training
 
@@ -143,15 +144,24 @@ Actions are `run`, `dry-run`, `status`, `adopt`, `harvest`, `schedule`, and
 | `--lookback-hours N` | Initial transcript lookback; `0` scans all history |
 | `--max-sessions N` / `--max-tasks N` | Bound the harvested workload |
 | `--target-skill-path PATH` | Explicit skill document to stage/adopt |
+| `--skill-root PATH` | Add a skill-resolution root; repeatable, with relative paths resolved below `--project` |
 | `--tasks-file PATH` | Replay a reviewed task JSON file instead of harvesting |
 | `--edit-budget N` | Maximum bounded edits for the night |
 | `--progress` / `--json` | Progress or machine-readable output |
 | `--auto-adopt` | Apply an accepted staged proposal automatically |
 
 `adopt` also accepts `--skill NAME` (repeatable) and `--all-skills` for a night
-that staged per-skill proposals. Bare `adopt` on that night lists the names and
-exits instead of promoting every skill. See
+that staged per-skill proposals. Use `--legacy` to adopt only a co-staged
+managed `SKILL.md` / `CLAUDE.md` proposal. Bare `adopt` on a fan-out night lists
+the names and exits instead of promoting anything. A leading-dash name must use
+the unambiguous `--skill=--name` form. See
 [multi-skill staging](../sleep/multi-skill-staging.md).
+
+Fan-out resolves existing project-native `.agents/skills`, `.claude/skills`,
+`.cursor/skills`, and `.devin/skills` directories plus the established Claude
+roots. Use `--skill-root` for another integration-specific location. Configure
+the canonical `multi_skill_fanout` key to enable proposal fan-out;
+`multi_skill_report` remains a compatibility alias.
 
 The `mock` and `handoff` backends make no network calls. A real backend sends
 mining, replay, judging, and reflection prompts derived from harvested

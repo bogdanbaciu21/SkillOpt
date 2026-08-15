@@ -49,7 +49,8 @@ an importable `skillopt_sleep` module. Install with `uv tool install skillopt` o
 > supports the base Sleep CLI, while Cursor source/backend/plugin support,
 > Pi source/backend support, handoff, Sleep support for non-Azure
 > OpenAI-compatible endpoints, OpenCode Sleep source/backend support, and
-> `--preferences` require a source checkout from `main` until the next release.
+> `--preferences`, multi-skill fan-out, and reviewed subset adoption require a
+> source checkout from `main` until the next release.
 
 ## One sleep cycle
 

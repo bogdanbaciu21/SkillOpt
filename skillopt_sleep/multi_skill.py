@@ -13,8 +13,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
 
-from skillopt_sleep.backend import Backend
+from skillopt_sleep.backend import Backend, CursorBackendError
 from skillopt_sleep.consolidate import ConsolidationResult, consolidate
+from skillopt_sleep.handoff_backend import PendingCalls
 from skillopt_sleep.types import SkillGroupReport, TaskRecord
 
 CONSOLIDATED = "consolidated"
@@ -52,6 +53,7 @@ def consolidate_groups(
     memory: str = "",
     *,
     consolidate_fn: Callable[..., ConsolidationResult] = consolidate,
+    group_kwargs_fn: Optional[Callable[[SkillGroup], Dict[str, object]]] = None,
     **consolidate_kwargs: object,
 ) -> Dict[str, GroupConsolidation]:
     """Consolidate each group independently, in order, isolating failures.
@@ -70,10 +72,15 @@ def consolidate_groups(
 
     ``memory`` is the shared agent memory and is passed through read-only: group
     runs evolve skills only, so no group can rewrite another group's memory.
+    ``group_kwargs_fn`` can add group-scoped inputs such as recalled history;
+    its ordinary failures are isolated to that group. ``PendingCalls`` and
+    ``CursorBackendError`` from either the factory or consolidator propagate as
+    cycle-level pause/fail-closed control flow rather than becoming report rows.
     """
     # This wrapper's contract is stricter than consolidate(): shared memory is
     # always read-only.  Override a caller-supplied value instead of passing a
     # duplicate keyword (which would otherwise turn the group into a failure).
+    consolidate_kwargs = dict(consolidate_kwargs)
     consolidate_kwargs["evolve_memory"] = False
     out: Dict[str, GroupConsolidation] = {}
     for group in groups:
@@ -95,10 +102,20 @@ def consolidate_groups(
             )
             continue
         try:
+            group_kwargs = dict(consolidate_kwargs)
+            if group_kwargs_fn is not None:
+                group_kwargs.update(group_kwargs_fn(group))
+                # A per-group factory cannot weaken the shared-memory invariant.
+                group_kwargs["evolve_memory"] = False
             result = consolidate_fn(
                 backend, list(group.tasks), group.skill, memory,
-                **consolidate_kwargs,
+                **group_kwargs,
             )
+        except (PendingCalls, CursorBackendError):
+            # These exceptions are cycle-level control flow, not isolated
+            # evidence about one group. Swallowing them can advance/save an
+            # incomplete handoff night or weaken Cursor's fail-closed path.
+            raise
         except Exception as exc:  # one group's failure must not abort the night
             out[name] = GroupConsolidation(
                 name, FAILED, reason=f"{type(exc).__name__}: {exc}"[:300],

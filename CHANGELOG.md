@@ -7,6 +7,17 @@ All notable changes to SkillOpt are documented here. This project adheres to
 ## [Unreleased]
 
 ### Added
+- **SkillOpt-Sleep multi-skill fan-out and reviewed subset adoption**: each
+  hinted skill is consolidated from its own pinned live baseline, staged as an
+  independent proposal with per-skill gate evidence, and promoted only through
+  an explicit `--skill`, `--all-skills`, or managed `--legacy` choice. Adoption
+  uses a versioned fail-closed manifest, provenance hashes, canonical target
+  pins, immutable backups/receipts, cross-night locking, durable publication,
+  and restart-recoverable transactions. Fan-out discovers native project skill
+  roots, supports repeatable `--skill-root` overrides, and is enabled by
+  `multi_skill_fanout` (`multi_skill_report` remains an alias). MCP adapters
+  enforce typed arguments and preserve engine failures without copying outside
+  the transaction (thanks @bogdanbaciu21, #212).
 - **OpenCode transcript source** (`--source opencode`) for SkillOpt-Sleep. It
   reads visible user/assistant text and tool names from OpenCode's local SQLite
   history without requiring its CLI, login, or a provider connection.
@@ -110,8 +121,8 @@ All notable changes to SkillOpt are documented here. This project adheres to
 Thank you to the contributors behind this unreleased work:
 @AKhozya, @Alphaxalchemy, @Phoenix0531-sudo, @SparshGarg999,
 @Tanmay9223, @chirag127, @codeL1985, @dimitarvdenev,
-@ichoosetoaccept, @jcforever1, @nankingjing, @wilyan09007, @xs229, and
-@zixuanguo786-ctrl.
+@bogdanbaciu21, @ichoosetoaccept, @jcforever1, @nankingjing, @wilyan09007,
+@xs229, and @zixuanguo786-ctrl.
 
 ## [0.2.0] — 2026-07-02
 

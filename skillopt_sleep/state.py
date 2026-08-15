@@ -11,9 +11,10 @@ short-term -> long-term transfer). It records:
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 
 def _now_iso(clock: Optional[float] = None) -> str:
@@ -37,7 +38,10 @@ DEFAULT_STATE: Dict[str, Any] = {
 class SleepState:
     def __init__(self, path: str, data: Optional[Dict[str, Any]] = None) -> None:
         self.path = path
-        self.data = data if data is not None else dict(DEFAULT_STATE)
+        # DEFAULT_STATE contains mutable lists and dicts. A shallow copy makes
+        # independent projects in one Python process share history, harvest
+        # cursors, and recalled tasks until they are persisted.
+        self.data = data if data is not None else copy.deepcopy(DEFAULT_STATE)
 
     # io ---------------------------------------------------------------------
     @classmethod
@@ -46,12 +50,12 @@ class SleepState:
             try:
                 with open(path) as f:
                     data = json.load(f)
-                merged = dict(DEFAULT_STATE)
+                merged = copy.deepcopy(DEFAULT_STATE)
                 merged.update(data if isinstance(data, dict) else {})
                 return cls(path, merged)
             except Exception:
                 pass
-        return cls(path, dict(DEFAULT_STATE))
+        return cls(path, copy.deepcopy(DEFAULT_STATE))
 
     def save(self) -> None:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
