@@ -339,13 +339,20 @@ def mine(
     *,
     max_tasks: int = 40,
     candidate_limit: int = 0,
-    holdout_fraction: float = 0.34,
+    val_fraction: float = 0.34,
+    test_fraction: float = 0.0,
+    holdout_fraction: float | None = None,  # legacy alias for val_fraction
     seed: int = 42,
     llm_miner: Optional[Callable[[List[SessionDigest]], List[TaskRecord]]] = None,
     target_skill_text: str = "",
     target_skill_path: str = "",
 ) -> List[TaskRecord]:
-    """Top-level miner. Uses ``llm_miner`` if provided, else heuristic."""
+    """Top-level miner. Uses ``llm_miner`` if provided, else heuristic.
+
+    Split knobs mirror ``assign_splits``: ``val_fraction``/``test_fraction``
+    are the real controls; ``holdout_fraction`` remains the legacy alias and,
+    when passed, overrides ``val_fraction`` (same contract as assign_splits).
+    """
     candidate_limit = candidate_limit or max_tasks
     tasks: List[TaskRecord] = []
     if llm_miner is not None:
@@ -361,5 +368,11 @@ def mine(
     if target_skill_text or target_skill_path:
         tasks = filter_tasks_for_target(tasks, target_skill_text, target_skill_path)
     tasks = tasks[:max_tasks]
-    tasks = assign_splits(tasks, holdout_fraction=holdout_fraction, seed=seed)
+    tasks = assign_splits(
+        tasks,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+        holdout_fraction=holdout_fraction,
+        seed=seed,
+    )
     return tasks

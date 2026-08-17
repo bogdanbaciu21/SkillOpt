@@ -21,12 +21,13 @@ from typing import List, Optional, Sequence
 
 from skillopt_sleep import evidence
 from skillopt_sleep.backend import Backend, CursorBackendError, build_backend
-from skillopt_sleep.config import SleepConfig, load_config
+from skillopt_sleep.config import DEFAULTS, SleepConfig, load_config
 from skillopt_sleep.dream import dream_consolidate
 from skillopt_sleep.evidence import EvidenceLog
 from skillopt_sleep.harvest_sources import harvest_for_config
 from skillopt_sleep.memory import ensure_skill_scaffold
 from skillopt_sleep.mine import group_tasks_by_skill_hint, mine
+from skillopt_sleep.replay import aggregate_scores, replay_batch
 from skillopt_sleep.multi_skill import (
     SKIPPED,
     GroupConsolidation,
@@ -51,6 +52,41 @@ from skillopt_sleep.types import SessionDigest, SleepReport, TaskRecord
 _ANSI_ESCAPE_RE = re.compile(
     r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-_])"
 )
+
+
+def _resolve_split_fractions(cfg: SleepConfig) -> tuple[float, float]:
+    """Return ``(val_fraction, test_fraction)`` for tonight's split.
+
+    ``holdout_fraction`` is the documented legacy alias for ``val_fraction``.
+    ``load_config`` records which keys came from the user's file or explicit
+    overrides in ``_user_config_keys``; the alias applies only when the user
+    set ``holdout_fraction`` and did not set ``val_fraction``. An explicit
+    ``val_fraction`` (including ``0.0``) always wins over the alias.
+
+    Raises ``ValueError`` when fractions are out of range or their sum is >= 1.
+    """
+    user_keys = set(cfg.get("_user_config_keys") or ())
+
+    if "val_fraction" in user_keys:
+        val = float(cfg.get("val_fraction"))
+    else:
+        val = float(DEFAULTS["val_fraction"])
+        if "holdout_fraction" in user_keys:
+            val = float(cfg.get("holdout_fraction"))
+
+    if "test_fraction" in user_keys:
+        test = float(cfg.get("test_fraction"))
+    else:
+        test = float(DEFAULTS["test_fraction"])
+
+    for name, value in (("val_fraction", val), ("test_fraction", test)):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be between 0 and 1 inclusive, got {value}")
+    if val + test >= 1.0:
+        raise ValueError(
+            f"val_fraction + test_fraction must be < 1 (got {val} + {test})"
+        )
+    return val, test
 
 
 # ── Model-swap detection (F16) ───────────────────────────────
@@ -658,7 +694,7 @@ def run_sleep_cycle(
             "backend", "model", "optimizer_backend", "optimizer_model",
             "target_backend", "target_model", "gate_mode", "gate_metric",
             "gate_mixed_weight", "gate_no_regression", "edit_budget",
-            "holdout_fraction",
+            "holdout_fraction", "val_fraction", "test_fraction",
             "dream_rollouts", "dream_factor", "recall_k",
             "max_tasks_per_night", "lookback_hours", "llm_mine",
             "evolve_skill", "evolve_memory")}
@@ -758,12 +794,14 @@ def run_sleep_cycle(
             f"mine start: max_tasks={max_tasks} candidate_limit={candidate_limit} "
             f"llm_mine={llm_miner is not None} target_filter={target_filter}",
         )
+        val_fraction, test_fraction = _resolve_split_fractions(cfg)
         try:
             tasks = mine(
                 digests,
                 max_tasks=max_tasks,
                 candidate_limit=candidate_limit,
-                holdout_fraction=cfg.get("holdout_fraction", 0.34),
+                val_fraction=val_fraction,
+                test_fraction=test_fraction,
                 seed=cfg.get("seed", 42),
                 llm_miner=llm_miner,
                 target_skill_text=raw_skill if target_filter else "",
@@ -853,6 +891,24 @@ def run_sleep_cycle(
     report.rejected_edits = result.rejected_edits
     report.unmatched_edits = result.unmatched_edits
     report.gate_trials = redact_secrets(getattr(result, "gate_trials", []))
+
+    # ── held-out test measure (write-only; the gate never reads it) ──────
+    # consolidate() holds the test split out entirely and documents that the
+    # caller scores it; in the nightly, this is that caller. Scored on the
+    # night's FINAL documents (post-gate-decision), mirroring how the
+    # experiment harness reports its per-night test score. With the default
+    # test_fraction=0.0 no test task exists and this block never runs, so
+    # legacy nights are bit-for-bit unchanged and cost nothing extra.
+    test_tasks = [t for t in tasks if t.split == "test"]
+    if test_tasks and ev is not None:
+        final_skill = result.new_skill if result.accepted else skill
+        final_memory = result.new_memory if result.accepted else memory
+        test_pairs = replay_batch(backend, test_tasks, final_skill, final_memory)
+        test_hard, test_soft = aggregate_scores(test_pairs)
+        ev.log("test", "held_out_score", night=night,
+               n_test=len(test_tasks),
+               hard=round(test_hard, 4), soft=round(test_soft, 4),
+               accepted=result.accepted, gate_action=result.gate_action)
 
     # ── 4b. optional per-skill group reporting ───────────────────────────
     # Off by default. When enabled, tonight's tasks are grouped by their skill
