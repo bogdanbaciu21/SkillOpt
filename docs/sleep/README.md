@@ -35,6 +35,14 @@ candidate; an absent numeric score aborts evaluation. Task-level changes are
 included in `report.md`, `report.json`, `diagnostics.json`, the CLI's `--json`
 output, and the evidence log.
 
+Rule-based heading checks are intentionally additive. `section_present` keeps
+its legacy strict behavior for existing task sets: an ATX heading cannot append
+text after the requested name. Use `section_contains` when a numbered,
+bilingual, or annotated ATX Markdown heading should pass; it matches the
+requested text literally and case-insensitively within the ATX heading only,
+not in bold lines, labels, or ordinary body text. Both operators are shape-only
+checks and should be paired with an outcome check or substantive rubric.
+
 > **Data boundary.** Harvesting is local and read-only. The `mock` backend makes no
 > provider calls. A real backend, however, sends truncated excerpts from harvested
 > sessions and derived tasks to the provider you select for mining, replay, judging,
@@ -206,21 +214,27 @@ skillopt-sleep run --project "$(pwd)" \
   --opencode-path /absolute/path/to/opencode --model provider/model
 ```
 
-For plain calls, SkillOpt disables project configuration, tool use, external
-plugins, and configured MCP servers. It stops before the model call if it cannot
-confirm that every resolved MCP server is disabled. The subprocess keeps
-OpenCode's normal data directory, so calls may appear in the user's OpenCode
-session history. SkillOpt sets `OPENCODE_CONFIG_CONTENT` for the child process
-to define the temporary agent and disable configured MCP servers. This replaces
-the user's existing value in that child process, so settings supplied only
-through that value are unavailable; use file-based global configuration or
-provider environment variables instead.
+Plain calls disable project configuration, model-initiated tool invocation,
+external plugins, and configured MCP servers. SkillOpt stops before the model
+call if it cannot confirm that every resolved MCP server is disabled.
 
-Tool-aware replay and a native OpenCode plugin or command are not implemented
-yet. For scheduled runs, configure the source, database, executable, and model
-in `~/.skillopt-sleep/config.json` as needed; the
-[CLI reference](../reference/cli.md#opencode-source-and-backend) has the full
-scheduler details.
+Tool-aware replay is disabled by default. Enable it with
+`--opencode-tool-replay` or `"opencode_tool_replay": true` for tasks whose rule
+judge contains a `tool_called` check. It exposes temporary synthetic tools with
+randomized names and fixed results, verifies which tools OpenCode actually
+invokes, and denies all other tools. Historical tool arguments and results are
+not retained or replayed.
+
+Both modes continue to use OpenCode's normal data directory and file-based
+global configuration. Calls may therefore appear in session history, and global
+custom JS/TS tools may initialize, although SkillOpt does not allow the model to
+invoke them. See the
+[CLI reference](../reference/cli.md#opencode-source-and-backend) for complete
+configuration, history, and isolation details.
+
+For scheduled runs, configure the source, database, executable, and model in
+`~/.skillopt-sleep/config.json` as needed. Set `opencode_tool_replay` to `true`
+there to opt in to tool-aware replay.
 
 ### Cursor
 
