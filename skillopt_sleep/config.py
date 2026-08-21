@@ -214,13 +214,20 @@ def _load_file(path: str) -> Dict[str, Any]:
 
 def load_config(**overrides: Any) -> SleepConfig:
     data = dict(DEFAULTS)
+    user_keys: set[str] = set()
     path = _user_config_path()
     if path:
         try:
-            data.update(_load_file(path) or {})
+            file_data = _load_file(path) or {}
+            user_keys.update(file_data.keys())
+            data.update(file_data)
         except Exception:
             pass
-    data.update({k: v for k, v in overrides.items() if v is not None})
+    for key, value in overrides.items():
+        if value is not None:
+            data[key] = value
+            user_keys.add(key)
     if data.get("projects") == "invoked" and not data.get("invoked_project"):
         data["invoked_project"] = os.getcwd()
+    data["_user_config_keys"] = sorted(user_keys)
     return SleepConfig(data=data)

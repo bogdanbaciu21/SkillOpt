@@ -304,8 +304,21 @@ def assign_splits(
 
     val_cut = int(round(val_fraction * 100))
     test_cut = val_cut + int(round(test_fraction * 100))
+
+    def _stable_key(task: TaskRecord) -> tuple[int, str]:
+        bucket = int(hashlib.sha256((str(seed) + task.id).encode()).hexdigest(), 16)
+        return bucket, task.id
+
+    def _promote_one(*, to: str, from_splits: set[str]) -> None:
+        """Promote one real task using hash order; never demote hash-assigned test."""
+        candidates = [t for t in real if t.split in from_splits]
+        if not candidates:
+            return
+        candidates.sort(key=_stable_key)
+        candidates[0].split = to
+
     for t in real:
-        bucket = int(hashlib.sha256((str(seed) + t.id).encode()).hexdigest(), 16) % 100
+        bucket = _stable_key(t)[0] % 100
         if bucket < val_cut:
             t.split = "val"
         elif bucket < test_cut:
@@ -313,19 +326,13 @@ def assign_splits(
         else:
             t.split = "train"
 
-    # guarantee val (the gate) is non-empty when we have >=2 real tasks
-    real_splits = {t.split for t in real}
-    if len(real) >= 2 and "val" not in real_splits:
-        real[-1].split = "val"
-    # guarantee a train pool exists (dream or real) when possible
+    # Guarantee val (the gate) is non-empty when we have >=2 real tasks.
+    # Only promote from train so hash-assigned test tasks stay untouched.
+    if len(real) >= 2 and not any(t.split == "val" for t in real):
+        _promote_one(to="val", from_splits={"train"})
+    # Guarantee a train pool exists when possible; never borrow from test.
     if not any(t.split == "train" for t in tasks) and len(real) >= 2:
-        real[0].split = "train"
-    # if test was requested but ended up empty with >=3 real tasks, carve one
-    if test_fraction > 0 and len(real) >= 3 and not any(t.split == "test" for t in real):
-        for t in real:
-            if t.split == "train":
-                t.split = "test"
-                break
+        _promote_one(to="train", from_splits={"val"})
     return tasks
 
 

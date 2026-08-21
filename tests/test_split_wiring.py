@@ -15,7 +15,7 @@ import unittest
 
 from skillopt_sleep.config import DEFAULTS, load_config
 from skillopt_sleep.cycle import _resolve_split_fractions, run_sleep_cycle
-from skillopt_sleep.mine import mine
+from skillopt_sleep.mine import assign_splits, mine
 from skillopt_sleep.types import TaskRecord
 
 
@@ -80,6 +80,76 @@ class TestConfigAliasPrecedence(unittest.TestCase):
     def test_test_fraction_flows(self):
         _, test = _resolve_split_fractions(self._cfg(test_fraction=0.25))
         self.assertEqual(test, 0.25)
+
+    def test_explicit_zero_val_fraction_is_preserved(self):
+        val, _ = _resolve_split_fractions(self._cfg(val_fraction=0.0))
+        self.assertEqual(val, 0.0)
+
+    def test_explicit_val_at_default_beats_alias(self):
+        val, _ = _resolve_split_fractions(
+            self._cfg(val_fraction=0.34, holdout_fraction=0.5))
+        self.assertEqual(val, 0.34)
+
+    def test_invalid_fraction_sum_raises(self):
+        with self.assertRaises(ValueError):
+            _resolve_split_fractions(self._cfg(val_fraction=0.6, test_fraction=0.5))
+
+
+class TestSplitStabilityAcrossNights(unittest.TestCase):
+    def test_appending_tasks_does_not_reassign_existing_test(self):
+        first = assign_splits(
+            _mk_tasks(4), val_fraction=0.34, test_fraction=0.10, seed=42,
+        )
+        splits_first = {t.id: t.split for t in first}
+        second = assign_splits(
+            _mk_tasks(5), val_fraction=0.34, test_fraction=0.10, seed=42,
+        )
+        splits_second = {t.id: t.split for t in second}
+        for task_id, split in splits_first.items():
+            self.assertEqual(
+                splits_second[task_id], split,
+                f"{task_id} changed split when a new task was appended",
+            )
+
+    def test_maintainer_repro_seed_42_t1_does_not_reassign_t4(self):
+        """Hash splits are id-stable; appending t1 must not move t4's split."""
+        base = [TaskRecord(id=f"t{i}", project="/p", intent=f"task {i}") for i in (0, 3, 4)]
+        with_t1 = base + [TaskRecord(id="t1", project="/p", intent="task 1")]
+        first = assign_splits(list(base), val_fraction=0.34, test_fraction=0.10, seed=42)
+        second = assign_splits(list(with_t1), val_fraction=0.34, test_fraction=0.10, seed=42)
+        self.assertEqual(next(t for t in second if t.id == "t1").split, "test")
+        self.assertEqual(
+            next(t for t in first if t.id == "t4").split,
+            next(t for t in second if t.id == "t4").split,
+        )
+
+
+class TestRecallSplitHygiene(unittest.TestCase):
+    def test_archived_test_tasks_are_never_recalled(self):
+        from skillopt_sleep.dream import recall_similar
+
+        new = TaskRecord(id="n1", project="/p", intent="validate login form")
+        archived_test = TaskRecord(
+            id="same-id", project="/p", intent="validate login form fields",
+            split="test",
+        )
+        recalled = recall_similar([new], [archived_test], k=1)
+        self.assertEqual(recalled, [])
+
+    def test_recall_honors_exclude_ids_for_tonights_held_out(self):
+        from skillopt_sleep.dream import recall_similar
+
+        held = TaskRecord(
+            id="held-out", project="/p", intent="validate login form fields",
+            split="train",
+        )
+        new_train = TaskRecord(
+            id="n1", project="/p", intent="validate login form", split="train",
+        )
+        recalled = recall_similar(
+            [new_train], [held], k=1, exclude_ids={"held-out"},
+        )
+        self.assertEqual(recalled, [])
 
 
 class TestHeldOutScoreEvidence(unittest.TestCase):
