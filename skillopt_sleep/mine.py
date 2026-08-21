@@ -295,6 +295,17 @@ def assign_splits(
     if holdout_fraction is not None:
         val_fraction = holdout_fraction
 
+    for name, value in (("val_fraction", val_fraction), ("test_fraction", test_fraction)):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(
+                f"{name} must be between 0 and 1 inclusive, got {value}"
+            )
+    if val_fraction + test_fraction >= 1.0:
+        raise ValueError(
+            f"val_fraction + test_fraction must be < 1 "
+            f"(got {val_fraction} + {test_fraction})"
+        )
+
     dream = [t for t in tasks if t.origin == "dream"]
     real = [t for t in tasks if t.origin != "dream"]
 
