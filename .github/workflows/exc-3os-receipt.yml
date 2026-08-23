@@ -1,0 +1,72 @@
+name: exc-3os-receipt
+
+# Fork-only 3-OS receipts. Not on the EXC feature PR branches, so this file
+# never appears in microsoft/SkillOpt PRs. Dispatch with fork_branch set to
+# exc-002-paired-evalkit or exc-003-llm-dream.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fork_branch:
+        description: Fork feature branch to clone and test
+        required: true
+        type: choice
+        options:
+          - exc-002-paired-evalkit
+          - exc-003-llm-dream
+  push:
+    branches: [ci/exc-3os-receipt]
+
+permissions:
+  contents: read
+
+jobs:
+  receipt:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Clone selected fork branch and run the suite
+        env:
+          DISPATCH_BRANCH: ${{ github.event.inputs.fork_branch }}
+        run: |
+          set -e
+          echo "===BEGIN==="
+          BRANCH="${DISPATCH_BRANCH:-exc-002-paired-evalkit}"
+          if [ "$BRANCH" = "exc-003-llm-dream" ]; then
+            EXPECTED=2dd30f1d51621ad193cffeb10be0b0a5816a3175
+            WIRING=tests/test_llm_dream.py
+          else
+            EXPECTED=79447e311807a03639eded8fadf8d7467eb9035e
+            WIRING=tests/test_evalkit.py
+          fi
+          git clone --quiet --depth 1 --branch "$BRANCH" https://github.com/bogdanbaciu21/SkillOpt skillopt
+          cd skillopt
+          echo "PLATFORM: $(uname -srm)"
+          python --version
+          HEAD=$(git rev-parse HEAD)
+          echo "FORK_BRANCH: $BRANCH"
+          echo "BRANCH_HEAD: $HEAD"
+          echo "EXPECTED_HEAD: $EXPECTED"
+          if [ "$HEAD" != "$EXPECTED" ]; then
+            echo "ERR_SHA_MISMATCH expected=$EXPECTED got=$HEAD"
+          fi
+          python -m venv .venv
+          if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=.venv/Scripts/python; fi
+          "$PY" -m pip install -q -e ".[dev]" pytest-timeout
+          echo "COLLECTED: $("$PY" -m pytest --collect-only -q | tail -1)"
+          echo "WIRING: $("$PY" -m pytest "$WIRING" -q | tail -1)"
+          set +e
+          "$PY" -m pytest -q -rf --timeout=120 --timeout-method=thread
+          echo "PYTEST_RC=$?"
+          echo "===END==="
+          exit 0
