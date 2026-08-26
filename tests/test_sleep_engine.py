@@ -1744,7 +1744,7 @@ class TestCursorBackend(unittest.TestCase):
         )
         self.assertEqual(
             cfg.cursor_projects_dir,
-            os.path.join(os.path.expanduser("~/.cursor-custom"), "projects"),
+            os.path.join(os.path.abspath(os.path.expanduser("~/.cursor-custom")), "projects"),
         )
 
         direct_cfg = load_config(
@@ -1753,7 +1753,7 @@ class TestCursorBackend(unittest.TestCase):
         )
         self.assertEqual(
             direct_cfg.cursor_projects_dir,
-            os.path.join(os.path.expanduser("~/.cursor-config"), "projects"),
+            os.path.join(os.path.abspath(os.path.expanduser("~/.cursor-config")), "projects"),
         )
         self.assertEqual(
             resolve_cursor_path(direct_cfg.get("cursor_path")),
