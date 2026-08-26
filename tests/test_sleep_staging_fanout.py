@@ -446,6 +446,45 @@ class TestWriteStagingCompatibility(unittest.TestCase):
                 self.assertEqual(handle.read(), "20260814-010203\n")
             self.assertFalse(any(name.startswith(".tmp-") for name in os.listdir(root)))
 
+    def test_staging_descendant_accepts_root_alias_but_rejects_child_symlink(self):
+        from skillopt_sleep import staging as staging_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real_root = os.path.join(tmp, "real-staging")
+            os.makedirs(real_root)
+            alias_root = os.path.join(tmp, "staging-alias")
+            outside = os.path.join(tmp, "outside")
+            os.makedirs(outside)
+            try:
+                os.symlink(real_root, alias_root, target_is_directory=True)
+                os.symlink(
+                    outside,
+                    os.path.join(real_root, "child-alias"),
+                    target_is_directory=True,
+                )
+            except OSError:
+                self.skipTest("directory symlinks unavailable")
+
+            ordinary = os.path.join(real_root, "backup.md")
+            with open(ordinary, "w", encoding="utf-8") as handle:
+                handle.write("backup")
+            escaped = os.path.join(alias_root, "child-alias", "outside.md")
+            with open(os.path.join(outside, "outside.md"), "w", encoding="utf-8") as handle:
+                handle.write("outside")
+
+            self.assertTrue(
+                staging_mod._existing_path_is_canonical_staging_descendant(
+                    ordinary,
+                    alias_root,
+                )
+            )
+            self.assertFalse(
+                staging_mod._existing_path_is_canonical_staging_descendant(
+                    escaped,
+                    alias_root,
+                )
+            )
+
     def test_latest_ignores_a_symlinked_night(self):
         with tempfile.TemporaryDirectory() as tmp:
             real_night = write_staging(

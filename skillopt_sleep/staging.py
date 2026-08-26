@@ -1933,14 +1933,27 @@ def _existing_path_is_canonical_staging_descendant(
     The staging root itself may be supplied through a symlink, so compare the
     resolved candidate with the same relative path beneath the resolved root.
     """
-    try:
-        relative = os.path.relpath(path, staging_dir)
-    except ValueError:
-        return False
-    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
-        return False
-    expected_real = os.path.join(os.path.realpath(staging_dir), relative)
-    return _path_identity_key(os.path.realpath(path)) == _path_identity_key(expected_real)
+    candidate_abs = os.path.abspath(path)
+    root_abs = os.path.abspath(staging_dir)
+    root_real = os.path.realpath(root_abs)
+    # A caller may hold a lexical spelling of the staging root while WAL paths
+    # carry its canonical spelling (/var vs /private/var on macOS, or a Windows
+    # short name vs long name). Derive the relative path from either root
+    # spelling, then still require the candidate's resolved path to equal that
+    # exact location under the resolved root. A symlinked descendant therefore
+    # remains a refusal rather than being blessed by realpath containment.
+    for root_spelling in (root_abs, root_real):
+        try:
+            relative = os.path.relpath(candidate_abs, root_spelling)
+        except ValueError:
+            continue
+        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+            continue
+        expected_real = os.path.join(root_real, relative)
+        return _path_identity_key(os.path.realpath(candidate_abs)) == (
+            _path_identity_key(expected_real)
+        )
+    return False
 
 
 def _immutable_backup_snapshot(
