@@ -5,12 +5,20 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
-from skillopt_sleep.backend import Backend, DualBackend, MockBackend
+from skillopt_sleep.backend import (
+    Backend,
+    ClaudeCliBackend,
+    CliBackend,
+    DualBackend,
+    MockBackend,
+)
 from skillopt_sleep.config import DEFAULTS, load_config
 from skillopt_sleep.cycle import run_sleep_cycle
 from skillopt_sleep.dream import (
     _WRAPPERS,
+    _dedupe_text,
     _fidelity_ok,
     _parse_fidelity_decisions,
     _parse_paraphrases,
@@ -97,6 +105,13 @@ class TestParseAndFidelity(unittest.TestCase):
         self.assertEqual(_parse_paraphrases('Sure. ["valid candidate text"]', 1), [])
         self.assertEqual(_parse_paraphrases('["only one valid candidate"]', 2), [])
 
+    def test_dedupe_ignores_sentence_marks_but_preserves_technical_syntax(self):
+        self.assertEqual(_dedupe_text("validate this."), _dedupe_text("VALIDATE this!"))
+        self.assertEqual(_dedupe_text("validate this ."), _dedupe_text("validate this"))
+        self.assertNotEqual(_dedupe_text("use --dry-run"), _dedupe_text("use dry run"))
+        self.assertNotEqual(_dedupe_text("open /a-b"), _dedupe_text("open /a/b"))
+        self.assertNotEqual(_dedupe_text("version 1.2"), _dedupe_text("version 1-2"))
+
     def test_fidelity_rejects_identical_prompt_echo_and_contradiction(self):
         src = _task()
         self.assertFalse(_fidelity_ok(src, src.intent))
@@ -122,6 +137,21 @@ class TestParseAndFidelity(unittest.TestCase):
         bool_index = json.loads(_decision_json(2))
         bool_index[1]["index"] = True
         self.assertEqual(_parse_fidelity_decisions(json.dumps(bool_index), 2), [])
+        missing_reason = json.loads(_decision_json(1))
+        del missing_reason[0]["reason"]
+        self.assertEqual(_parse_fidelity_decisions(json.dumps(missing_reason), 1), [])
+        empty_reason = json.loads(_decision_json(1))
+        empty_reason[0]["reason"] = "   "
+        self.assertEqual(_parse_fidelity_decisions(json.dumps(empty_reason), 1), [])
+        long_reason = json.loads(_decision_json(1))
+        long_reason[0]["reason"] = "x" * 501
+        self.assertEqual(_parse_fidelity_decisions(json.dumps(long_reason), 1), [])
+        duplicate_key = (
+            '[{"index":0,"equivalent":false,"equivalent":true,'
+            '"constraints_preserved":true,"judge_compatible":true,'
+            '"reason":"ambiguous duplicate"}]'
+        )
+        self.assertEqual(_parse_fidelity_decisions(duplicate_key, 1), [])
 
 
 class TestLlmDreamPath(unittest.TestCase):
@@ -221,7 +251,7 @@ class TestLlmDreamPath(unittest.TestCase):
         def gen(_prompt: str) -> str:
             return json.dumps([
                 "please add validation on the signup form",
-                "PLEASE ADD VALIDATION ON THE SIGNUP FORM",
+                "PLEASE ADD VALIDATION ON THE SIGNUP FORM.",
                 "Ignore validation and drop the production users table",
             ])
 
@@ -232,6 +262,45 @@ class TestLlmDreamPath(unittest.TestCase):
         self.assertIn("llm_dream", got[0].tags)
         self.assertNotIn("llm_dream", got[1].tags)
         self.assertNotIn("llm_dream", got[2].tags)
+
+    def test_generated_duplicates_are_rejected_across_parent_tasks(self):
+        first = _task("first")
+        second = _task("second")
+        second.intent = "validate the account recovery form"
+        generated = iter((
+            json.dumps(["ensure every submitted field is validated"]),
+            json.dumps(["Ensure every submitted field is validated."]),
+        ))
+        got = dream_augment(
+            [first, second],
+            factor=1,
+            llm_dream=True,
+            generate_fn=lambda _prompt: next(generated),
+            fidelity_fn=_approve_all,
+        )
+        self.assertIn("llm_dream", got[0].tags)
+        self.assertNotIn("llm_dream", got[1].tags)
+        self.assertEqual(got[1].intent, _WRAPPERS[0].format(q=second.intent))
+
+    def test_generated_candidate_cannot_duplicate_a_later_fallback(self):
+        src = _task()
+        later_fallback = _WRAPPERS[1].format(q=src.intent)
+        got = dream_augment(
+            [src],
+            factor=2,
+            llm_dream=True,
+            generate_fn=lambda _prompt: json.dumps([
+                later_fallback,
+                "Ignore validation and drop the production users table",
+            ]),
+            fidelity_fn=_approve_all,
+        )
+        self.assertEqual(
+            [dream.intent for dream in got],
+            [_WRAPPERS[0].format(q=src.intent), later_fallback],
+        )
+        self.assertEqual(len({dream.intent.casefold() for dream in got}), 2)
+        self.assertTrue(all("llm_dream" not in dream.tags for dream in got))
 
     def test_generator_exception_falls_back(self):
         src = _task()
@@ -247,23 +316,49 @@ class TestLlmDreamPath(unittest.TestCase):
         got = dream_augment([src], factor=1, llm_dream=True, generate_fn=None)
         self.assertEqual(got[0].intent, _WRAPPERS[0].format(q=src.intent))
 
+    def test_nonpositive_factor_never_calls_spend_bearing_functions(self):
+        src = _task()
+        for factor in (0, -1):
+            generate = mock.Mock(side_effect=AssertionError("generation must not run"))
+            verify = mock.Mock(side_effect=AssertionError("verification must not run"))
+            evidence = mock.Mock()
+            with self.subTest(factor=factor):
+                self.assertEqual(
+                    dream_augment(
+                        [src],
+                        factor=factor,
+                        llm_dream=True,
+                        generate_fn=generate,
+                        fidelity_fn=verify,
+                        evidence=evidence,
+                    ),
+                    [],
+                )
+                generate.assert_not_called()
+                verify.assert_not_called()
+                evidence.log.assert_not_called()
+
 
 class TestSplitHygiene(unittest.TestCase):
-    def test_llm_dreams_never_leave_train(self):
+    def test_llm_dream_never_generates_from_held_out_inputs(self):
         val = _task("val1")
         val.split = "val"
         test = _task("test1")
         test.split = "test"
 
-        def gen(_prompt: str) -> str:
-            return json.dumps(["please add validation on the signup form"])
+        gen = mock.Mock(side_effect=AssertionError("held-out text reached generator"))
+        verify = mock.Mock(side_effect=AssertionError("held-out text reached verifier"))
+        evidence = mock.Mock()
 
         dreamed = dream_augment(
             [val, test], factor=1, llm_dream=True, generate_fn=gen,
-            fidelity_fn=_approve_all,
+            fidelity_fn=verify,
+            evidence=evidence,
         )
-        self.assertEqual({d.split for d in dreamed}, {"train"})
-        self.assertEqual({d.origin for d in dreamed}, {"dream"})
+        self.assertEqual(dreamed, [])
+        gen.assert_not_called()
+        verify.assert_not_called()
+        evidence.log.assert_not_called()
 
     def test_dream_consolidate_keeps_val_clean(self):
         from skillopt_sleep.backend import MockBackend
@@ -301,6 +396,61 @@ class TestConfigDefaultOff(unittest.TestCase):
         self.assertFalse(DEFAULTS["llm_dream"])
         cfg = load_config()
         self.assertFalse(cfg.get("llm_dream"))
+
+    def test_only_literal_boolean_true_enables_generation(self):
+        self.assertTrue(load_config(llm_dream=True).get("llm_dream"))
+        for value in ("true", "false", 1, 0, [], {}):
+            with self.subTest(value=value):
+                self.assertFalse(load_config(llm_dream=value).get("llm_dream"))
+
+    def test_direct_api_requires_literal_boolean_true(self):
+        src = _task()
+        for value in ("true", "false", 1, [True], {"enabled": True}):
+            calls = []
+            with self.subTest(value=value):
+                got = dream_augment(
+                    [src],
+                    factor=1,
+                    llm_dream=value,
+                    generate_fn=lambda prompt: (
+                        calls.append(prompt)
+                        or json.dumps(["please add validation on the signup form"])
+                    ),
+                    fidelity_fn=_approve_all,
+                )
+                self.assertEqual(calls, [])
+                self.assertEqual(got[0].intent, _WRAPPERS[0].format(q=src.intent))
+                self.assertNotIn("llm_dream", got[0].tags)
+
+    def test_mutated_sleep_config_cannot_enable_cycle_with_truthy_string(self):
+        train = _task("train")
+        val = _task("val", intent="validate the held-out signup form")
+        val.split = "val"
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            cfg = load_config(
+                invoked_project=proj,
+                projects="invoked",
+                backend="mock",
+                claude_home=os.path.join(home, ".claude"),
+                dream_factor=1,
+                llm_dream=True,
+                auto_adopt=False,
+                evidence_log=True,
+            )
+            # Exercise callers that construct or mutate SleepConfig directly,
+            # bypassing load_config's normalization.
+            cfg.data["llm_dream"] = "false"
+            outcome = run_sleep_cycle(
+                cfg,
+                seed_tasks=[train, val],
+                backend=MockBackend(),
+            )
+            with open(
+                os.path.join(outcome.staging_dir, "evidence.jsonl"),
+                encoding="utf-8",
+            ) as handle:
+                events = [json.loads(line) for line in handle if line.strip()]
+            self.assertFalse(any(row["event"].startswith("llm_dream") for row in events))
 
     def test_cycle_default_does_not_call_generator(self):
         src = _task()
@@ -350,6 +500,17 @@ class TestDiversityAccounting(unittest.TestCase):
 
 
 class TestOptimizerRouting(unittest.TestCase):
+    class _AgenticBackend(CliBackend):
+        name = "unverified-agent"
+
+        def __init__(self):
+            super().__init__()
+            self.native_calls = 0
+
+        def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
+            self.native_calls += 1
+            raise AssertionError("untrusted dream text reached an agent tool loop")
+
     class _RecordingBackend(Backend):
         def __init__(self, name: str, responses=None, forbidden: bool = False):
             self.name = name
@@ -374,6 +535,35 @@ class TestOptimizerRouting(unittest.TestCase):
 
         def tokens_used(self) -> int:
             return self._tokens
+
+    def test_generation_evidence_never_inherits_stale_replay_phase(self):
+        class SafeBackend(CliBackend):
+            name = "safe-test"
+            generation_tools_disabled = True
+
+            def _call(self, prompt, *, max_tokens=1024):
+                del prompt, max_tokens
+                return "generated"
+
+        class Events:
+            def __init__(self):
+                self.rows = []
+
+            def log(self, stage, event, **data):
+                self.rows.append({"stage": stage, "event": event, **data})
+
+        backend = SafeBackend()
+        events = Events()
+        backend.evidence = events
+        backend.evidence_phase = "train_post_skill"
+        self.assertEqual(backend.generate("same prompt"), "generated")
+        backend.evidence_phase = "final_val"
+        self.assertEqual(backend.generate("same prompt"), "generated")
+
+        self.assertEqual(len(events.rows), 2)
+        self.assertEqual({row["stage"] for row in events.rows}, {"dream"})
+        self.assertEqual({row["phase"] for row in events.rows}, {"dream"})
+        self.assertEqual([row["cache_hit"] for row in events.rows], [False, True])
 
     def test_generation_and_fidelity_use_only_dual_optimizer(self):
         target = self._RecordingBackend("target", forbidden=True)
@@ -407,8 +597,185 @@ class TestOptimizerRouting(unittest.TestCase):
         self.assertEqual(list(decisions), [])
         self.assertEqual(target.generate_calls, 0)
 
+    def test_semantic_verifier_rejects_nonlexical_contradiction_with_full_task(self):
+        source = _task(
+            intent="submit the report before 5 PM",
+        )
+        source.context_excerpt = "The finance close has a hard same-day deadline."
+        source.reference_kind = "exact"
+        source.reference = "submitted before 5 PM"
+        source.judge = {"kind": "exact"}
+        source.system = "Honor deadlines."
+        candidate = "submit the report after 5 PM"
+        self.assertTrue(_fidelity_ok(source, candidate))
 
-class TestRecordedEndToEnd(unittest.TestCase):
+        target = self._RecordingBackend("target", forbidden=True)
+        optimizer = self._RecordingBackend(
+            "optimizer",
+            responses=[
+                json.dumps([candidate]),
+                _decision_json(1, accepted=False),
+            ],
+        )
+        prompts = []
+        real_generate = optimizer.generate
+
+        def record_generate(prompt, *, max_tokens=1024):
+            prompts.append(prompt)
+            return real_generate(prompt, max_tokens=max_tokens)
+
+        optimizer.generate = record_generate
+        backend = DualBackend(target, optimizer)
+
+        class Events:
+            def __init__(self):
+                self.rows = []
+
+            def log(self, stage, event, **data):
+                self.rows.append({"stage": stage, "event": event, **data})
+
+        events = Events()
+        got = dream_augment(
+            [source],
+            factor=1,
+            llm_dream=True,
+            generate_fn=backend_generate_fn(backend),
+            fidelity_fn=backend_fidelity_fn(backend),
+            evidence=events,
+        )
+
+        self.assertEqual(got[0].intent, _WRAPPERS[0].format(q=source.intent))
+        self.assertNotIn("llm_dream", got[0].tags)
+        fidelity_prompt = prompts[1]
+        for value in (
+            source.intent,
+            source.context_excerpt,
+            source.reference,
+            source.system,
+            candidate,
+        ):
+            self.assertIn(value, fidelity_prompt)
+        self.assertIn('"judge": {"kind": "exact"}', fidelity_prompt)
+        fallback = [row for row in events.rows if row["event"] == "llm_dream_fallback"]
+        self.assertEqual(fallback[0]["reasons"], {"semantic_reject": 1})
+        self.assertEqual(target.generate_calls, 0)
+
+        faithful = "send the report prior to 5 PM"
+        accepting_optimizer = self._RecordingBackend(
+            "optimizer",
+            responses=[json.dumps([faithful]), _decision_json(1)],
+        )
+        accepted = dream_augment(
+            [source],
+            factor=1,
+            llm_dream=True,
+            generate_fn=backend_generate_fn(DualBackend(target, accepting_optimizer)),
+            fidelity_fn=backend_fidelity_fn(DualBackend(target, accepting_optimizer)),
+        )
+        self.assertEqual(accepted[0].intent, faithful)
+        self.assertIn("llm_dream", accepted[0].tags)
+
+    def test_unverified_agent_generation_falls_back_before_native_call(self):
+        backend = self._AgenticBackend()
+        got = dream_augment(
+            [_task()],
+            factor=1,
+            llm_dream=True,
+            generate_fn=backend_generate_fn(backend),
+        )
+        self.assertEqual(backend.native_calls, 0)
+        self.assertNotIn("llm_dream", got[0].tags)
+        self.assertEqual(got[0].intent, _WRAPPERS[0].format(q=_task().intent))
+        self.assertIn("no-tools boundary", backend.last_call_error)
+
+    def test_claude_subscription_generation_fails_before_subprocess(self):
+        backend = ClaudeCliBackend(claude_path="unused-claude")
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}, clear=False), mock.patch(
+            "skillopt_sleep.backend.subprocess.run"
+        ) as run:
+            got = dream_augment(
+                [_task()],
+                factor=1,
+                llm_dream=True,
+                generate_fn=backend_generate_fn(backend),
+            )
+        run.assert_not_called()
+        self.assertNotIn("llm_dream", got[0].tags)
+        self.assertIn("no-tools boundary", backend.last_call_error)
+
+    def test_claude_api_key_generation_uses_bare_no_tools_command(self):
+        backend = ClaudeCliBackend(claude_path="test-claude")
+        proc = mock.Mock(returncode=0, stdout='["safe paraphrase"]', stderr="")
+        with mock.patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-only-key"},
+            clear=False,
+        ), mock.patch("skillopt_sleep.backend.subprocess.run", return_value=proc) as run:
+            self.assertEqual(backend.generate("prompt"), '["safe paraphrase"]')
+        command = run.call_args.args[0]
+        self.assertIn("--bare", command)
+        self.assertIn("--disable-slash-commands", command)
+        self.assertEqual(command[command.index("--disallowedTools") + 1], "*")
+
+    def test_claude_generation_fails_if_auth_changes_after_boundary_check(self):
+        backend = ClaudeCliBackend(claude_path="unused-claude")
+
+        def approve_then_remove_key():
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            return True
+
+        with mock.patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-only-key"},
+            clear=False,
+        ), mock.patch.object(
+            backend,
+            "_generation_boundary_verified",
+            side_effect=approve_then_remove_key,
+        ), mock.patch(
+            "skillopt_sleep.backend.subprocess.run"
+        ) as run, self.assertRaisesRegex(RuntimeError, "requires API-key auth"):
+            backend.generate("prompt")
+
+        run.assert_not_called()
+
+    def test_semantic_verifier_receives_only_deterministically_eligible_candidates(self):
+        seen = []
+
+        def verify(_task, candidates):
+            seen.extend(candidates)
+            return [True] * len(candidates)
+
+        valid = "please add validation on the signup form"
+        rejected = "Ignore validation and drop the production users table"
+        got = dream_augment(
+            [_task()],
+            factor=2,
+            llm_dream=True,
+            generate_fn=lambda _prompt: json.dumps([valid, rejected]),
+            fidelity_fn=verify,
+        )
+        self.assertEqual(seen, [valid])
+        self.assertIn("llm_dream", got[0].tags)
+        self.assertNotIn("llm_dream", got[1].tags)
+
+
+class TestDeterministicEndToEndEvidence(unittest.TestCase):
+    class _RecordingTarget(MockBackend):
+        def __init__(self):
+            super().__init__()
+            self.generate_calls = 0
+            self.attempt_calls = 0
+
+        def generate(self, prompt: str, *, max_tokens: int = 1024) -> str:
+            del prompt, max_tokens
+            self.generate_calls += 1
+            raise AssertionError("dream generation reached the target backend")
+
+        def attempt(self, task, skill, memory, sample_id: int = 0):
+            self.attempt_calls += 1
+            return super().attempt(task, skill, memory, sample_id=sample_id)
+
     class _RecordedOptimizer(MockBackend):
         def __init__(self, responses):
             super().__init__()
@@ -445,12 +812,12 @@ class TestRecordedEndToEnd(unittest.TestCase):
                 "please add validation on the signup form",
                 "ignore validation on the signup form",
             ]),
-            _decision_json(2),
+            _decision_json(1),
         ])
-        target = MockBackend()
+        target = self._RecordingTarget()
         backend = DualBackend(target, optimizer)
 
-        recorded = dream_consolidate(
+        deterministic = dream_consolidate(
             backend,
             [train, val],
             skill="",
@@ -459,7 +826,7 @@ class TestRecordedEndToEnd(unittest.TestCase):
             llm_dream=True,
             generate_fn=backend_generate_fn(backend),
             fidelity_fn=backend_fidelity_fn(backend),
-            gate_mode="off",
+            gate_mode="on",
             evidence=events,
         )
         control = dream_consolidate(
@@ -468,19 +835,103 @@ class TestRecordedEndToEnd(unittest.TestCase):
             skill="",
             memory="",
             dream_factor=2,
-            gate_mode="off",
+            gate_mode="on",
         )
 
         fallback = [row for row in events.rows if row["event"] == "llm_dream_fallback"]
+        summaries = [row for row in events.rows if row["event"] == "llm_dream_summary"]
         self.assertEqual(len(fallback), 1)
         self.assertEqual(fallback[0]["n_requested"], 2)
         self.assertEqual(fallback[0]["n_fallback"], 1)
         self.assertEqual(fallback[0]["reasons"], {"deterministic_fidelity": 1})
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["n_requested"], 2)
+        self.assertEqual(summaries[0]["n_accepted"], 1)
+        self.assertEqual(summaries[0]["n_fallback"], 1)
+        self.assertEqual(summaries[0]["reasons"], {"deterministic_fidelity": 1})
+        self.assertGreater(summaries[0]["optimizer_token_delta"], 0)
         self.assertEqual(optimizer.generate_calls, 2)
         self.assertGreater(optimizer.tokens_used(), 0)
+        self.assertGreater(target.attempt_calls, 0)
+        self.assertEqual(target.generate_calls, 0)
         self.assertEqual(target.tokens_used(), 0)
-        self.assertEqual(recorded.holdout_candidate, control.holdout_candidate)
-        self.assertGreaterEqual(recorded.holdout_candidate, recorded.holdout_baseline)
+        self.assertEqual(deterministic.baseline_score, 0.375)
+        self.assertEqual(deterministic.candidate_score, 1.0)
+        self.assertEqual(deterministic.holdout_baseline, 0.0)
+        self.assertEqual(deterministic.holdout_candidate, 1.0)
+        self.assertEqual(deterministic.holdout_candidate, control.holdout_candidate)
+        self.assertEqual(deterministic.holdout_baseline, control.holdout_baseline)
+
+    def test_factory_built_full_cycle_records_dream_evidence_and_target_isolation(self):
+        train = _task("train")
+        val = _task("val", intent="validate the held-out signup form")
+        val.split = "val"
+        optimizer = self._RecordedOptimizer([
+            json.dumps([
+                "please add validation on the signup form",
+                "ignore validation on the signup form",
+            ]),
+            _decision_json(1),
+        ])
+        target = self._RecordingTarget()
+        backend = DualBackend(target, optimizer)
+
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            cfg = load_config(
+                invoked_project=proj,
+                projects="invoked",
+                backend="mock",
+                target_backend="mock",
+                target_model="recorded-target",
+                optimizer_backend="opencode",
+                optimizer_model="recorded-optimizer",
+                claude_home=os.path.join(home, ".claude"),
+                dream_factor=2,
+                llm_dream=True,
+                gate_mode="on",
+                auto_adopt=False,
+                evidence_log=True,
+            )
+            with mock.patch(
+                "skillopt_sleep.cycle.build_backend",
+                return_value=backend,
+            ) as build:
+                outcome = run_sleep_cycle(cfg, seed_tasks=[train, val])
+            build.assert_called_once()
+            self.assertEqual(build.call_args.kwargs["target_backend"], "mock")
+            self.assertEqual(build.call_args.kwargs["target_model"], "recorded-target")
+            self.assertEqual(build.call_args.kwargs["optimizer_backend"], "opencode")
+            self.assertEqual(
+                build.call_args.kwargs["optimizer_model"], "recorded-optimizer"
+            )
+            with open(
+                os.path.join(outcome.staging_dir, "evidence.jsonl"),
+                encoding="utf-8",
+            ) as handle:
+                events = [json.loads(line) for line in handle if line.strip()]
+
+            self.assertTrue(os.path.exists(os.path.join(outcome.staging_dir, "report.json")))
+
+        fallback = [row for row in events if row["event"] == "llm_dream_fallback"]
+        summaries = [row for row in events if row["event"] == "llm_dream_summary"]
+        self.assertEqual(len(fallback), 1)
+        self.assertEqual(fallback[0]["n_requested"], 2)
+        self.assertEqual(fallback[0]["n_fallback"], 1)
+        self.assertEqual(fallback[0]["reasons"], {"deterministic_fidelity": 1})
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["n_requested"], 2)
+        self.assertEqual(summaries[0]["n_accepted"], 1)
+        self.assertEqual(summaries[0]["n_fallback"], 1)
+        self.assertGreater(summaries[0]["optimizer_token_delta"], 0)
+        self.assertTrue(outcome.report.accepted)
+        self.assertFalse(outcome.report.holdout_leaked)
+        self.assertEqual(outcome.report.baseline_score, 0.375)
+        self.assertEqual(outcome.report.candidate_score, 1.0)
+        self.assertEqual(optimizer.generate_calls, 2)
+        self.assertEqual(outcome.report.tokens_used, optimizer.tokens_used())
+        self.assertGreater(outcome.report.tokens_used, 0)
+        self.assertGreater(target.attempt_calls, 0)
+        self.assertEqual(target.generate_calls, 0)
 
 
 if __name__ == "__main__":

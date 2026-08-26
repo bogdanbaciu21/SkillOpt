@@ -63,6 +63,20 @@ def _canonical_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value or "").casefold().split())
 
 
+def _dedupe_text(value: str) -> str:
+    """Ignore trailing sentence marks without erasing technical punctuation."""
+    return _canonical_text(value).rstrip(".?!。！？").rstrip()
+
+
+def _reject_duplicate_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
 _NEGATION_MARKERS = re.compile(
     r"\b(?:cannot|can't|do\s+not|don't|drop|ignore|never|no|not|omit|remove|skip|without)\b",
     re.IGNORECASE,
@@ -116,23 +130,31 @@ def _fidelity_ok(task: TaskRecord, paraphrase: str) -> bool:
 def _parse_fidelity_decisions(raw: str, n: int) -> List[bool]:
     """Parse exact, indexed semantic-verification decisions."""
     try:
-        parsed = json.loads((raw or "").strip())
+        parsed = json.loads(
+            (raw or "").strip(), object_pairs_hook=_reject_duplicate_json_keys
+        )
     except (TypeError, ValueError, RecursionError):
         return []
     if not isinstance(parsed, list) or len(parsed) != n:
         return []
     decisions: List[bool] = []
-    required = {"index", "equivalent", "constraints_preserved", "judge_compatible"}
-    allowed = required | {"reason"}
+    required = {
+        "index",
+        "equivalent",
+        "constraints_preserved",
+        "judge_compatible",
+        "reason",
+    }
     for expected, item in enumerate(parsed):
-        if not isinstance(item, dict) or not required.issubset(item) or set(item) - allowed:
+        if not isinstance(item, dict) or set(item) != required:
             return []
         if type(item["index"]) is not int or item["index"] != expected:
             return []
         flags = [item[name] for name in ("equivalent", "constraints_preserved", "judge_compatible")]
         if any(type(flag) is not bool for flag in flags):
             return []
-        if "reason" in item and not isinstance(item["reason"], str):
+        reason = item["reason"]
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
             return []
         decisions.append(all(flags))
     return decisions
@@ -161,6 +183,7 @@ def dream_augment(
     generate_fn: Optional[GenerateFn] = None,
     fidelity_fn: Optional[FidelityFn] = None,
     evidence=None,
+    stats: Optional[dict] = None,
 ) -> List[TaskRecord]:
     """Create synthetic TRAIN variants of real tasks (origin='dream').
 
@@ -175,17 +198,46 @@ def dream_augment(
     byte-identical to the pre-llm_dream implementation.
     """
     out: List[TaskRecord] = []
-    use_llm = bool(llm_dream) and generate_fn is not None
-    if llm_dream and generate_fn is None and evidence is not None:
+    # This helper is public enough to be called outside dream_consolidate.
+    # Enforce the training-only boundary for the new spend-bearing LLM path;
+    # preserve the legacy template helper's behavior. Production
+    # dream_consolidate already selects only training seeds in either mode.
+    train_tasks = (
+        [task for task in real_tasks if _normalize_split(task.split) == "train"]
+        if llm_dream is True
+        else list(real_tasks)
+    )
+    # This path can spend provider tokens.  Require the literal boolean True at
+    # the public API boundary as well as in config loading; truthy strings such
+    # as "false" must never opt callers in accidentally.
+    use_llm = llm_dream is True and generate_fn is not None
+    total_requested = len(train_tasks) * max(0, factor)
+    total_accepted = 0
+    total_reasons: dict[str, int] = {}
+    reserved_intents = {
+        _dedupe_text(intent)
+        for task in train_tasks
+        for intent in (
+            task.intent,
+            *(_template_intent(task, k) for k in range(max(0, factor))),
+        )
+    }
+    emitted_generated: set[str] = set()
+    if (
+        llm_dream is True
+        and generate_fn is None
+        and evidence is not None
+        and total_requested > 0
+    ):
         evidence.log(
             "dream", "llm_dream_fallback",
-            reason="no_generate_fn", n_requested=max(0, factor),
+            reason="no_generate_fn", n_requested=total_requested,
         )
-    for t in real_tasks:
+    for t in train_tasks:
         requested = max(0, factor)
         parsed: List[str] = []
         reasons: dict[str, int] = {}
-        if use_llm:
+        if use_llm and requested > 0:
             try:
                 from skillopt_sleep import prompts as prompt_registry
                 prompt = prompt_registry.render("llm_dream", {
@@ -197,13 +249,16 @@ def dream_augment(
             except Exception:
                 parsed = []
                 reasons["generation_error"] = requested
-        if use_llm and not parsed and "generation_error" not in reasons:
+        if use_llm and requested > 0 and not parsed and "generation_error" not in reasons:
             reasons["malformed_generation"] = requested
 
         deterministic_ok = [False] * requested
-        seen = {_canonical_text(t.intent)}
+        # Reserve every deterministic fallback for this batch.  Otherwise a
+        # valid generated candidate can equal a later fallback and leave two
+        # identical training rows even though generated siblings were deduped.
+        seen = set(reserved_intents) | emitted_generated
         for k, candidate in enumerate(parsed):
-            key = _canonical_text(candidate)
+            key = _dedupe_text(candidate)
             if key in seen:
                 reasons["duplicate"] = reasons.get("duplicate", 0) + 1
                 continue
@@ -215,18 +270,29 @@ def dream_augment(
 
         semantic_ok = [False] * requested
         verifier_complete = False
-        if any(deterministic_ok):
+        eligible_indices = [
+            index for index, accepted in enumerate(deterministic_ok) if accepted
+        ]
+        if eligible_indices:
             if fidelity_fn is None:
-                reasons["missing_semantic_verifier"] = sum(deterministic_ok)
+                reasons["missing_semantic_verifier"] = len(eligible_indices)
             else:
                 try:
-                    decisions = list(fidelity_fn(t, parsed))
-                    if len(decisions) != requested or any(type(value) is not bool for value in decisions):
+                    # Do not send already-rejected or duplicate siblings into a
+                    # second model call. Apart from wasting tokens, a hostile
+                    # rejected candidate could interfere with verification of a
+                    # valid one.
+                    candidates = [parsed[index] for index in eligible_indices]
+                    decisions = list(fidelity_fn(t, candidates))
+                    if len(decisions) != len(candidates) or any(
+                        type(value) is not bool for value in decisions
+                    ):
                         raise ValueError("invalid semantic verifier response")
-                    semantic_ok = decisions
+                    for index, decision in zip(eligible_indices, decisions):
+                        semantic_ok[index] = decision
                     verifier_complete = True
                 except Exception:
-                    reasons["semantic_verifier_error"] = sum(deterministic_ok)
+                    reasons["semantic_verifier_error"] = len(eligible_indices)
         n_ok = 0
         for k in range(requested):
             extra: Optional[List[str]] = None
@@ -239,6 +305,7 @@ def dream_augment(
                 intent = parsed[k]
                 extra = ["llm_dream"]
                 n_ok += 1
+                emitted_generated.add(_dedupe_text(intent))
             else:
                 intent = _template_intent(t, k)
                 if verifier_complete and k < len(parsed) and deterministic_ok[k] and not semantic_ok[k]:
@@ -252,6 +319,18 @@ def dream_augment(
                 n_requested=requested,
                 reasons=reasons,
             )
+        total_accepted += n_ok
+        for reason, count in reasons.items():
+            total_reasons[reason] = total_reasons.get(reason, 0) + count
+    if llm_dream is True and generate_fn is None and total_requested:
+        total_reasons["no_generate_fn"] = total_requested
+    if stats is not None:
+        stats.update(
+            requested=total_requested,
+            accepted=total_accepted,
+            fallback=total_requested - total_accepted,
+            reasons=total_reasons,
+        )
     return out
 
 
@@ -395,14 +474,29 @@ def dream_consolidate(
         )
     if dream_factor > 0:
         seed = [t for t in enlarged if t.split == "train" and t.origin != "dream"]
-        enlarged += dream_augment(
+        dream_stats: dict = {}
+        tokens_before = backend.tokens_used()
+        dreamed = dream_augment(
             seed,
             factor=dream_factor,
             llm_dream=llm_dream,
             generate_fn=generate_fn,
             fidelity_fn=fidelity_fn,
             evidence=evidence,
+            stats=dream_stats,
         )
+        enlarged += dreamed
+        if llm_dream is True and evidence is not None:
+            evidence.log(
+                "dream",
+                "llm_dream_summary",
+                n_source_tasks=len(seed),
+                n_requested=dream_stats.get("requested", 0),
+                n_accepted=dream_stats.get("accepted", 0),
+                n_fallback=dream_stats.get("fallback", 0),
+                reasons=dream_stats.get("reasons", {}),
+                optimizer_token_delta=max(0, backend.tokens_used() - tokens_before),
+            )
     return consolidate(
         backend, enlarged, skill, memory,
         edit_budget=edit_budget, gate_metric=gate_metric,

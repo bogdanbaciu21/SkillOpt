@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from skillopt_sleep.backend import MockBackend, exact_score, keyword_soft_score
+from skillopt_sleep.backend import DualBackend, MockBackend, exact_score, keyword_soft_score
 from skillopt_sleep.config import load_config
 from skillopt_sleep.consolidate import consolidate
 from skillopt_sleep.cycle import _render_report_md, run_sleep_cycle
@@ -1375,7 +1375,9 @@ class TestFullCycleAndAdopt(unittest.TestCase):
 
     def test_cycle_can_target_repo_scoped_skill_path(self):
         with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
-            target = os.path.abspath(os.path.join(proj, ".agents/skills/taste-skill/SKILL.md"))
+            target = os.path.realpath(
+                os.path.abspath(os.path.join(proj, ".agents/skills/taste-skill/SKILL.md"))
+            )
             cfg = load_config(
                 invoked_project=proj,
                 projects="invoked",
@@ -1744,7 +1746,7 @@ class TestCursorBackend(unittest.TestCase):
         )
         self.assertEqual(
             cfg.cursor_projects_dir,
-            os.path.join(os.path.expanduser("~/.cursor-custom"), "projects"),
+            os.path.join(os.path.abspath(os.path.expanduser("~/.cursor-custom")), "projects"),
         )
 
         direct_cfg = load_config(
@@ -1753,7 +1755,7 @@ class TestCursorBackend(unittest.TestCase):
         )
         self.assertEqual(
             direct_cfg.cursor_projects_dir,
-            os.path.join(os.path.expanduser("~/.cursor-config"), "projects"),
+            os.path.join(os.path.abspath(os.path.expanduser("~/.cursor-config")), "projects"),
         )
         self.assertEqual(
             resolve_cursor_path(direct_cfg.get("cursor_path")),
@@ -2911,6 +2913,7 @@ class TestMultiSkillReportWiring(unittest.TestCase):
                 recall_k=7,
                 dream_rollouts=3,
                 dream_factor=2,
+                llm_dream=True,
                 edit_budget=6,
                 gate_metric="mixed",
                 gate_mixed_weight=0.37,
@@ -2951,7 +2954,14 @@ class TestMultiSkillReportWiring(unittest.TestCase):
                 # Keep this regression fast while preserving the exact
                 # arguments observed at the public orchestration boundary.
                 safe = dict(kwargs)
-                safe.update(recall_k=0, dream_rollouts=1, dream_factor=0)
+                safe.update(
+                    recall_k=0,
+                    dream_rollouts=1,
+                    dream_factor=0,
+                    llm_dream=False,
+                    generate_fn=None,
+                    fidelity_fn=None,
+                )
                 return real_dream_consolidate(
                     backend,
                     tasks,
@@ -2986,6 +2996,7 @@ class TestMultiSkillReportWiring(unittest.TestCase):
                 "recall_k": 7,
                 "dream_rollouts": 3,
                 "dream_factor": 2,
+                "llm_dream": True,
                 "edit_budget": 6,
                 "gate_metric": "mixed",
                 "gate_mixed_weight": 0.37,
@@ -3001,12 +3012,134 @@ class TestMultiSkillReportWiring(unittest.TestCase):
                 kwargs = call["kwargs"]
                 for key, value in expected.items():
                     self.assertEqual(kwargs[key], value, key)
+                self.assertTrue(callable(kwargs["generate_fn"]))
+                self.assertTrue(callable(kwargs["fidelity_fn"]))
                 self.assertFalse(kwargs["evolve_memory"])
                 hint = next(iter(call["hints"]))
                 self.assertEqual(
                     {task.skill_hint for task in kwargs["history_tasks"]},
                     {hint},
                 )
+
+    def test_real_fanout_executes_optimizer_dreams_without_cross_skill_leakage(self):
+        """Run aggregate and per-skill dreams, rather than only spying on kwargs."""
+
+        from collections import Counter
+
+        tasks = self._hinted_tasks()
+        intent_hints = {task.intent: task.skill_hint for task in tasks}
+
+        class RecordingTarget(MockBackend):
+            def __init__(self):
+                super().__init__()
+                self.generated = 0
+                self.dream_attempts = []
+
+            def generate(self, prompt, *, max_tokens=1024):
+                del prompt, max_tokens
+                self.generated += 1
+                raise AssertionError("fan-out generation reached target backend")
+
+            def attempt(self, task, skill, memory, sample_id=0):
+                if task.origin == "dream" and "llm_dream" in task.tags:
+                    self.dream_attempts.append((task.skill_hint, task.intent))
+                return super().attempt(task, skill, memory, sample_id=sample_id)
+
+        class RecordingOptimizer(MockBackend):
+            def __init__(self):
+                super().__init__()
+                self.generated_hints = []
+                self.verified = 0
+
+            def generate(self, prompt, *, max_tokens=1024):
+                del max_tokens
+                if "Candidate JSON array:" in prompt:
+                    self.verified += 1
+                    return json.dumps([{
+                        "index": 0,
+                        "equivalent": True,
+                        "constraints_preserved": True,
+                        "judge_compatible": True,
+                        "reason": "same task with an explicit group marker",
+                    }])
+                intent = prompt.split("Original intent:\n", 1)[1].split(
+                    "\n\nOptional context:", 1
+                )[0]
+                hint = intent_hints[intent]
+                self.generated_hints.append(hint)
+                return json.dumps([
+                    f"[{hint}] Please handle this exact request: {intent}"
+                ])
+
+        target = RecordingTarget()
+        optimizer = RecordingOptimizer()
+        backend = DualBackend(target, optimizer)
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            claude_home = os.path.join(home, ".claude")
+            self._write_live_skills(
+                claude_home, "research-skill", "programming-skill"
+            )
+            cfg = load_config(
+                invoked_project=proj,
+                projects="invoked",
+                backend="mock",
+                claude_home=claude_home,
+                managed_skill_name="skillopt-sleep-learned",
+                auto_adopt=False,
+                multi_skill_report=True,
+                dream_factor=1,
+                llm_dream=True,
+                gate_mode="off",
+            )
+            outcome = run_sleep_cycle(cfg, seed_tasks=tasks, backend=backend)
+
+            with open(
+                os.path.join(outcome.staging_dir, "evidence.jsonl"),
+                encoding="utf-8",
+            ) as handle:
+                events = [json.loads(line) for line in handle if line.strip()]
+
+            from skillopt_sleep.staging import staged_skills
+
+            self.assertEqual(
+                {row["skill_name"] for row in staged_skills(outcome.staging_dir)},
+                {"research-skill", "programming-skill"},
+            )
+        self.assertEqual(target.generated, 0)
+        self.assertGreater(optimizer.verified, 0)
+        train_counts = Counter(
+            task.skill_hint for task in tasks if task.split == "train"
+        )
+        self.assertEqual(
+            Counter(optimizer.generated_hints),
+            Counter({hint: 2 * count for hint, count in train_counts.items()}),
+        )
+        self.assertEqual(optimizer.verified, len(optimizer.generated_hints))
+        summaries = [
+            row for row in events if row.get("event") == "llm_dream_summary"
+        ]
+        expected_source_counts = sorted([
+            sum(train_counts.values()),
+            *train_counts.values(),
+        ])
+        self.assertEqual(
+            sorted(row["n_source_tasks"] for row in summaries),
+            expected_source_counts,
+        )
+        self.assertEqual(len(summaries), 3)
+        for row in summaries:
+            self.assertEqual(row["n_requested"], row["n_source_tasks"])
+            self.assertEqual(row["n_accepted"], row["n_requested"])
+            self.assertEqual(row["n_fallback"], 0)
+        self.assertTrue(target.dream_attempts)
+        for hint, intent in target.dream_attempts:
+            self.assertIn(f"[{hint}]", intent)
+            other = (
+                "programming-skill"
+                if hint == "research-skill"
+                else "research-skill"
+            )
+            self.assertNotIn(f"[{other}]", intent)
 
     def test_managed_and_fanout_proposals_never_target_the_same_live_file(self):
         from skillopt_sleep.staging import staged_skills

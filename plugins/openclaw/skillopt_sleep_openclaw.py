@@ -118,7 +118,14 @@ class OpenClawDeepSeekBackend(Backend):
         return out
 
     # ── 1. attempt: produce a response given the task + skill + memory ──
-    def attempt(self, task: TaskRecord, skill: str, memory: str) -> str:
+    def attempt(
+        self,
+        task: TaskRecord,
+        skill: str,
+        memory: str,
+        sample_id: int = 0,
+    ) -> str:
+        del sample_id  # OpenClaw calls are uncached; every rollout is independent.
         sys = (
             "You are an OpenClaw agent (Kobe ecosystem). Use the skill and memory below to complete the task. "
             "If the task asks for a structured output, follow the rubric exactly. "

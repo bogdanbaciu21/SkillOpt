@@ -212,6 +212,13 @@ def test_failed_empty_response_is_not_cached():
     assert call.call_count == 2
 
 
+def test_generate_routes_through_verified_pi_generation_call():
+    be = PiCliBackend()
+    with mock.patch.object(be, "_generation_call", return_value="paraphrase") as call:
+        assert be.generate("optimizer prompt", max_tokens=321) == "paraphrase"
+    call.assert_called_once_with("optimizer prompt", max_tokens=321)
+
+
 def test_success_clears_previous_call_error():
     be = PiCliBackend()
     be.last_call_error = "an older failure"

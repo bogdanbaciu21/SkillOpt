@@ -228,6 +228,10 @@ def load_config(**overrides: Any) -> SleepConfig:
         if value is not None:
             data[key] = value
             user_keys.add(key)
+    # This opt-in can spend provider tokens. Accept the JSON/YAML boolean only;
+    # values such as the string "false" are truthy in Python and must never
+    # accidentally enable generation.
+    data["llm_dream"] = data.get("llm_dream") is True
     if data.get("projects") == "invoked" and not data.get("invoked_project"):
         data["invoked_project"] = os.getcwd()
     data["_user_config_keys"] = sorted(user_keys)

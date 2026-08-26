@@ -849,6 +849,9 @@ def run_sleep_cycle(
     # consolidate — behavior is unchanged unless the user opts in.
     _progress(cfg, "consolidate start")
     recall_k = int(cfg.get("recall_k", 0) or 0)
+    # `llm_dream` is a spend-bearing opt-in.  Keep this strict even when a
+    # caller constructs/mutates SleepConfig directly instead of load_config().
+    llm_dream_enabled = cfg.get("llm_dream", False) is True
     history_tasks = []
     if recall_k > 0:
         history_tasks = [TaskRecord.from_dict(d) for d in state.task_archive()]
@@ -859,12 +862,12 @@ def run_sleep_cycle(
             recall_k=recall_k,
             dream_rollouts=int(cfg.get("dream_rollouts", 1) or 1),
             dream_factor=int(cfg.get("dream_factor", 0) or 0),
-            llm_dream=bool(cfg.get("llm_dream", False)),
+            llm_dream=llm_dream_enabled,
             generate_fn=(
-                backend_generate_fn(backend) if cfg.get("llm_dream", False) else None
+                backend_generate_fn(backend) if llm_dream_enabled else None
             ),
             fidelity_fn=(
-                backend_fidelity_fn(backend) if cfg.get("llm_dream", False) else None
+                backend_fidelity_fn(backend) if llm_dream_enabled else None
             ),
             evidence=ev,
             edit_budget=cfg.get("edit_budget", 4),
@@ -961,12 +964,12 @@ def run_sleep_cycle(
                     recall_k=recall_k,
                     dream_rollouts=int(cfg.get("dream_rollouts", 1) or 1),
                     dream_factor=int(cfg.get("dream_factor", 0) or 0),
-                    llm_dream=bool(cfg.get("llm_dream", False)),
+                    llm_dream=llm_dream_enabled,
                     generate_fn=(
-                        backend_generate_fn(backend) if cfg.get("llm_dream", False) else None
+                        backend_generate_fn(backend) if llm_dream_enabled else None
                     ),
                     fidelity_fn=(
-                        backend_fidelity_fn(backend) if cfg.get("llm_dream", False) else None
+                        backend_fidelity_fn(backend) if llm_dream_enabled else None
                     ),
                     evidence=ev,
                     edit_budget=cfg.get("edit_budget", 4),
