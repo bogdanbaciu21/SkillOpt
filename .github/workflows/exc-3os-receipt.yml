@@ -16,12 +16,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         target:
-          - name: platform-baseline
-            branch: verify/common-platform-ab236c6
-            sha: 2a1e97499885264b65c34cd0d2f05444c7ef440b
-            focused: tests/test_sleep_adopt_skill_subset.py::TestDurableAdoptionTransaction::test_restart_cleans_own_hardlink_publication_temp
+          - name: pr242-final
+            branch: verify/pr242-final-7686629
+            sha: 76866294a8045c2fe80880ffdc1212df90f8883f
+            focused: tests/test_evalkit.py tests/test_sleep_staging_fanout.py tests/test_sleep_adopt_skill_subset.py
+          - name: pr244-final
+            branch: verify/pr244-final-9ef4da3
+            sha: 9ef4da31318b794e818cc68bbd7677ae70fa8ae7
+            focused: tests/test_llm_dream.py tests/test_sleep_engine.py tests/test_backend_opencode.py tests/test_backend_pi.py tests/test_plugin_sync.py tests/test_sleep_staging_fanout.py
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:
