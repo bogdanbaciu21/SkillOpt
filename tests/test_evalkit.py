@@ -122,6 +122,13 @@ class TestBootstrapCoverage(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(EvalkitError):
                 bootstrap_delta_ci([0], [value], n_boot=10)
 
+    def test_direct_api_scores_must_be_in_the_unit_interval(self):
+        for value in (-1, -0.00001, 1.00001, 2):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                EvalkitError, "between 0 and 1"
+            ):
+                bootstrap_delta_ci([0], [value], n_boot=10)
+
 
 class TestAACalibration(unittest.TestCase):
     def test_aa_does_not_reject(self):

@@ -256,6 +256,8 @@ def bootstrap_delta_ci(
         raise EvalkitError("bootstrap scores must be numeric and finite") from None
     if any(not math.isfinite(x) for x in numeric_a + numeric_b):
         raise EvalkitError("bootstrap scores must be numeric and finite")
+    if any(not 0.0 <= x <= 1.0 for x in numeric_a + numeric_b):
+        raise EvalkitError("bootstrap scores must be between 0 and 1")
     rng = random.Random(seed)
     n = len(a)
     deltas: List[float] = []
