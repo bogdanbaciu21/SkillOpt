@@ -18,14 +18,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         target:
-          - name: pr242
-            branch: verify/pr242-97e70b5
-            sha: 97e70b5c8c766e5c0492902ec4e14baf1fcd8119
-            focused: tests/test_evalkit.py
-          - name: pr244
-            branch: verify/pr244-de5e56f
-            sha: de5e56fef8baa5feba91d314d30395372e40b72b
-            focused: tests/test_llm_dream.py tests/test_sleep_evidence.py
+          - name: platform-baseline
+            branch: verify/common-platform-ab236c6
+            sha: 7e87d66cc4f670cdf95686ba8abf972d1519667d
+            focused: tests/test_devin_plugin.py tests/test_sleep_adopt_skill_subset.py tests/test_sleep_engine.py tests/test_sleep_scheduler_safety.py tests/test_sleep_skill_resolver.py tests/test_sleep_staging_fanout.py tests/test_superpowers_scenarios.py
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:
