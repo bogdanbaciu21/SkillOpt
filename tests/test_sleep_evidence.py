@@ -107,6 +107,17 @@ class TestPromptRegistry(unittest.TestCase):
         self.assertFalse(prompt_registry.is_overridden("judge"))
         self.assertIn("Score how well", prompt_registry.get_prompt("judge"))
 
+    def test_render_does_not_expand_placeholders_inside_untrusted_values(self):
+        prompt_registry.save_overrides({"judge": "__RUBRIC__ / __RESPONSE__"})
+        rendered = prompt_registry.render("judge", {
+            "__RUBRIC__": "literal __RESPONSE__ marker",
+            "__RESPONSE__": "attacker-controlled replacement",
+        })
+        self.assertEqual(
+            rendered,
+            "literal __RESPONSE__ marker / attacker-controlled replacement",
+        )
+
     def test_unknown_names_are_ignored(self):
         out = prompt_registry.save_overrides({"nope": "x", "miner": "M __PROMPTS__"})
         self.assertEqual(set(out), {"miner"})

@@ -60,6 +60,10 @@ class Backend:
                 sample_id: int = 0) -> str:
         raise NotImplementedError
 
+    def generate(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        """Run optimizer-side text generation, never target task execution."""
+        raise NotImplementedError
+
     def attempt_with_tools(
         self, task: TaskRecord, skill: str, memory: str, tools: List[str]
     ) -> Tuple[str, List[str]]:
@@ -358,6 +362,11 @@ class CliBackend(Backend):
         return out
 
     # operations -----------------------------------------------------------
+    def generate(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        """Generate optimizer material through the backend's native call path."""
+        key = "generate:" + skill_hash(prompt)
+        return self._cached_call(key, prompt, max_tokens=max_tokens)
+
     def attempt(self, task: TaskRecord, skill: str, memory: str,
                 sample_id: int = 0) -> str:
         # sample_id distinguishes repeated rollouts of the SAME (task, skill,
@@ -1735,7 +1744,12 @@ class CopilotCliBackend(CliBackend):
             "--stream", "off",
             "--no-color",
             "--log-level", "none",
+            # ``--allow-all-tools`` is REQUIRED for non-interactive mode (it waives
+            # the approval prompt); it is the permission axis. Tool *visibility* is
+            # a separate axis: ``--available-tools`` restricts which tools the model
+            # can see at all. Scoping happens there, so we keep both.
             "--allow-all-tools",
+            "--available-tools", os.environ.get("COPILOT_AVAILABLE_TOOLS", "bash"),
             "-C", clean_cwd,
         ]
         if not self.full_env:
@@ -1873,7 +1887,13 @@ class CopilotCliBackend(CliBackend):
                 "--stream", "off",
                 "--no-color",
                 "--log-level", "none",
+                # ``--allow-all-tools`` is REQUIRED for non-interactive mode (it
+                # waives the approval prompt); it is the permission axis. Tool
+                # *visibility* is a separate axis: ``--available-tools`` restricts
+                # which tools the model can see at all. Scoping happens there, so
+                # we keep both.
                 "--allow-all-tools",
+                "--available-tools", os.environ.get("COPILOT_AVAILABLE_TOOLS", "bash"),
                 "-C", work,
             ]
             if not self.full_env:
@@ -2144,6 +2164,7 @@ class DualBackend(Backend):
     """Route operations to two backends, à la SkillOpt's target vs optimizer.
 
       * attempt  -> TARGET backend (the model the skill is deployed on)
+      * generate -> OPTIMIZER backend (synthetic/optimizer-side material)
       * reflect  -> OPTIMIZER backend (the stronger/cheaper model writing edits)
       * judge    -> OPTIMIZER backend (graded by the optimizer when no local rule)
 
@@ -2161,6 +2182,9 @@ class DualBackend(Backend):
 
     def attempt(self, task, skill, memory, sample_id: int = 0):
         return self.target.attempt(task, skill, memory, sample_id=sample_id)
+
+    def generate(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        return self.optimizer.generate(prompt, max_tokens=max_tokens)
 
     def attempt_with_tools(self, task, skill, memory, tools):
         return self.target.attempt_with_tools(task, skill, memory, tools)

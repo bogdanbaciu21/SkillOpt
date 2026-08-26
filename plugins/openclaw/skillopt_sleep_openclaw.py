@@ -12,12 +12,10 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-from skillopt_sleep.backend import Backend, _normalize, exact_score
+from skillopt_sleep.backend import Backend, exact_score
 from skillopt_sleep.types import EditRecord, ReplayResult, TaskRecord
-
 
 # ── DeepSeek + Ollama OpenAI-compatible API client (curl-based, no extra deps) ──
 
@@ -107,6 +105,17 @@ class OpenClawDeepSeekBackend(Backend):
 
     def tokens_used(self) -> int:
         return self._tokens
+
+    def generate(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        """Generate optimizer material without entering task replay."""
+        out = _chat(
+            [{"role": "user", "content": prompt}],
+            model=self._model,
+            temperature=0.2,
+            max_tokens=max_tokens,
+        )
+        self._tokens += len(prompt) // 4 + len(out) // 4
+        return out
 
     # ── 1. attempt: produce a response given the task + skill + memory ──
     def attempt(self, task: TaskRecord, skill: str, memory: str) -> str:

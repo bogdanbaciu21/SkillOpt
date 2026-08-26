@@ -22,12 +22,11 @@ from typing import List, Optional, Sequence
 from skillopt_sleep import evidence
 from skillopt_sleep.backend import Backend, CursorBackendError, build_backend
 from skillopt_sleep.config import DEFAULTS, SleepConfig, load_config
-from skillopt_sleep.dream import backend_generate_fn, dream_consolidate
+from skillopt_sleep.dream import backend_fidelity_fn, backend_generate_fn, dream_consolidate
 from skillopt_sleep.evidence import EvidenceLog
 from skillopt_sleep.harvest_sources import harvest_for_config
 from skillopt_sleep.memory import ensure_skill_scaffold
 from skillopt_sleep.mine import group_tasks_by_skill_hint, mine
-from skillopt_sleep.replay import aggregate_scores, replay_batch
 from skillopt_sleep.multi_skill import (
     SKIPPED,
     GroupConsolidation,
@@ -36,6 +35,7 @@ from skillopt_sleep.multi_skill import (
     consolidate_groups,
     skill_group_reports,
 )
+from skillopt_sleep.replay import aggregate_scores, replay_batch
 from skillopt_sleep.skill_resolver import resolve_skill, skill_search_roots
 from skillopt_sleep.staging import (
     SkillProposal,
@@ -863,6 +863,9 @@ def run_sleep_cycle(
             generate_fn=(
                 backend_generate_fn(backend) if cfg.get("llm_dream", False) else None
             ),
+            fidelity_fn=(
+                backend_fidelity_fn(backend) if cfg.get("llm_dream", False) else None
+            ),
             evidence=ev,
             edit_budget=cfg.get("edit_budget", 4),
             gate_metric=cfg.get("gate_metric", "mixed"),
@@ -961,6 +964,9 @@ def run_sleep_cycle(
                     llm_dream=bool(cfg.get("llm_dream", False)),
                     generate_fn=(
                         backend_generate_fn(backend) if cfg.get("llm_dream", False) else None
+                    ),
+                    fidelity_fn=(
+                        backend_fidelity_fn(backend) if cfg.get("llm_dream", False) else None
                     ),
                     evidence=ev,
                     edit_budget=cfg.get("edit_budget", 4),

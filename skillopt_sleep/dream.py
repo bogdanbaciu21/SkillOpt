@@ -16,13 +16,16 @@ runs. Pure-stdlib, zero research/private dependency.
 """
 from __future__ import annotations
 
+import json
 import re
-from typing import Callable, List, Optional
+import unicodedata
+from typing import Callable, List, Optional, Sequence
 
 from skillopt_sleep.consolidate import ConsolidationResult, consolidate
 from skillopt_sleep.types import TaskRecord
 
 GenerateFn = Callable[[str], str]
+FidelityFn = Callable[[TaskRecord, Sequence[str]], Sequence[bool]]
 
 # ── synthetic augmentation ("dream up" variants of today's tasks) ─────────────
 
@@ -38,41 +41,101 @@ def _template_intent(task: TaskRecord, k: int) -> str:
 
 
 def _parse_paraphrases(raw: str, n: int) -> List[str]:
-    """Accept a JSON array of strings; drop empty / short / non-string items."""
-    from skillopt_sleep.backend import _extract_json
-    parsed = _extract_json(raw or "", "array")
-    if not isinstance(parsed, list):
+    """Accept exactly one JSON array containing exactly ``n`` safe strings."""
+    try:
+        parsed = json.loads((raw or "").strip())
+    except (TypeError, ValueError, RecursionError):
+        return []
+    if not isinstance(parsed, list) or len(parsed) != n:
         return []
     out: List[str] = []
     for item in parsed:
         if not isinstance(item, str):
-            continue
+            return []
         text = item.strip()
-        if len(text) < 8:
-            continue
+        if not 8 <= len(text) <= 4000:
+            return []
         out.append(text)
-        if len(out) >= n:
-            break
     return out
 
 
-def _fidelity_ok(original: str, paraphrase: str) -> bool:
-    """Paraphrase-only v1: keep the parent's constraints by construction.
+def _canonical_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value or "").casefold().split())
 
-    We copy reference/judge unchanged, so a constraint-changing rewrite would
-    mislabel the variant. Refuse empty, identical, and prompt-echo strings.
-    Constraint perturbations are deferred to a later redesign of judge
-    propagation.
+
+_NEGATION_MARKERS = re.compile(
+    r"\b(?:cannot|can't|do\s+not|don't|drop|ignore|never|no|not|omit|remove|skip|without)\b",
+    re.IGNORECASE,
+)
+
+
+def _protected_literals(value: str) -> set[str]:
+    """Extract explicit literals whose removal would change task constraints."""
+    literals = set()
+    patterns = (
+        r"`([^`\n]{1,160})`",
+        r"\"([^\"\n]{1,160})\"",
+        r"(?<!\w)--[A-Za-z0-9][A-Za-z0-9_-]*",
+        r"\b\d+(?:\.\d+)?(?:%|ms|s|m|h|kb|mb|gb)?\b",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, value or "", re.IGNORECASE):
+            literal = match.group(1) if match.lastindex else match.group(0)
+            normalized = _canonical_text(literal)
+            if normalized:
+                literals.add(normalized)
+    return literals
+
+
+def _fidelity_ok(task: TaskRecord, paraphrase: str) -> bool:
+    """Apply deterministic, fail-closed checks before semantic verification.
+
+    This is deliberately necessary but not sufficient: accepted candidates
+    must also pass the task-aware optimizer verifier supplied to
+    :func:`dream_augment`.
     """
     text = (paraphrase or "").strip()
-    src = (original or "").strip()
+    src = (task.intent or "").strip()
     if len(text) < 8 or not src:
         return False
-    if text == src:
+    if _canonical_text(text) == _canonical_text(src):
         return False
-    if "Return ONLY a JSON array" in text:
+    if "return only a json array" in _canonical_text(text):
+        return False
+    if len(text) > max(4000, len(src) * 4):
+        return False
+    # Adding or removing explicit negation is a common semantic inversion.
+    if bool(_NEGATION_MARKERS.search(src)) != bool(_NEGATION_MARKERS.search(text)):
+        return False
+    candidate = _canonical_text(text)
+    if any(literal not in candidate for literal in _protected_literals(src)):
         return False
     return True
+
+
+def _parse_fidelity_decisions(raw: str, n: int) -> List[bool]:
+    """Parse exact, indexed semantic-verification decisions."""
+    try:
+        parsed = json.loads((raw or "").strip())
+    except (TypeError, ValueError, RecursionError):
+        return []
+    if not isinstance(parsed, list) or len(parsed) != n:
+        return []
+    decisions: List[bool] = []
+    required = {"index", "equivalent", "constraints_preserved", "judge_compatible"}
+    allowed = required | {"reason"}
+    for expected, item in enumerate(parsed):
+        if not isinstance(item, dict) or not required.issubset(item) or set(item) - allowed:
+            return []
+        if type(item["index"]) is not int or item["index"] != expected:
+            return []
+        flags = [item[name] for name in ("equivalent", "constraints_preserved", "judge_compatible")]
+        if any(type(flag) is not bool for flag in flags):
+            return []
+        if "reason" in item and not isinstance(item["reason"], str):
+            return []
+        decisions.append(all(flags))
+    return decisions
 
 
 def _dream_record(task: TaskRecord, k: int, intent: str, extra_tags: Optional[List[str]] = None) -> TaskRecord:
@@ -96,6 +159,7 @@ def dream_augment(
     factor: int = 1,
     llm_dream: bool = False,
     generate_fn: Optional[GenerateFn] = None,
+    fidelity_fn: Optional[FidelityFn] = None,
     evidence=None,
 ) -> List[TaskRecord]:
     """Create synthetic TRAIN variants of real tasks (origin='dream').
@@ -118,52 +182,109 @@ def dream_augment(
             reason="no_generate_fn", n_requested=max(0, factor),
         )
     for t in real_tasks:
+        requested = max(0, factor)
         parsed: List[str] = []
+        reasons: dict[str, int] = {}
         if use_llm:
             try:
                 from skillopt_sleep import prompts as prompt_registry
                 prompt = prompt_registry.render("llm_dream", {
                     "__INTENT__": t.intent,
-                    "__N__": str(max(0, factor)),
+                    "__N__": str(requested),
                     "__CONTEXT__": (t.context_excerpt or "")[:400],
                 })
-                parsed = _parse_paraphrases(generate_fn(prompt), max(0, factor))
+                parsed = _parse_paraphrases(generate_fn(prompt), requested)
             except Exception:
                 parsed = []
+                reasons["generation_error"] = requested
+        if use_llm and not parsed and "generation_error" not in reasons:
+            reasons["malformed_generation"] = requested
+
+        deterministic_ok = [False] * requested
+        seen = {_canonical_text(t.intent)}
+        for k, candidate in enumerate(parsed):
+            key = _canonical_text(candidate)
+            if key in seen:
+                reasons["duplicate"] = reasons.get("duplicate", 0) + 1
+                continue
+            seen.add(key)
+            if not _fidelity_ok(t, candidate):
+                reasons["deterministic_fidelity"] = reasons.get("deterministic_fidelity", 0) + 1
+                continue
+            deterministic_ok[k] = True
+
+        semantic_ok = [False] * requested
+        verifier_complete = False
+        if any(deterministic_ok):
+            if fidelity_fn is None:
+                reasons["missing_semantic_verifier"] = sum(deterministic_ok)
+            else:
+                try:
+                    decisions = list(fidelity_fn(t, parsed))
+                    if len(decisions) != requested or any(type(value) is not bool for value in decisions):
+                        raise ValueError("invalid semantic verifier response")
+                    semantic_ok = decisions
+                    verifier_complete = True
+                except Exception:
+                    reasons["semantic_verifier_error"] = sum(deterministic_ok)
         n_ok = 0
-        for k in range(max(0, factor)):
+        for k in range(requested):
             extra: Optional[List[str]] = None
-            if use_llm and k < len(parsed) and _fidelity_ok(t.intent, parsed[k]):
+            if (
+                use_llm
+                and k < len(parsed)
+                and deterministic_ok[k]
+                and semantic_ok[k]
+            ):
                 intent = parsed[k]
                 extra = ["llm_dream"]
                 n_ok += 1
             else:
                 intent = _template_intent(t, k)
+                if verifier_complete and k < len(parsed) and deterministic_ok[k] and not semantic_ok[k]:
+                    reasons["semantic_reject"] = reasons.get("semantic_reject", 0) + 1
             out.append(_dream_record(t, k, intent, extra))
-        if use_llm and n_ok < max(0, factor) and evidence is not None:
+        if use_llm and n_ok < requested and evidence is not None:
             evidence.log(
                 "dream", "llm_dream_fallback",
                 task_id=t.id,
-                n_fallback=max(0, factor) - n_ok,
-                n_requested=max(0, factor),
+                n_fallback=requested - n_ok,
+                n_requested=requested,
+                reasons=reasons,
             )
     return out
 
 
 def backend_generate_fn(backend) -> GenerateFn:
-    """Adapter: reuse Backend.attempt so every backend can paraphrase.
-
-    The probe task is never added to the training pool.
-    """
+    """Return optimizer-side generation without entering target task replay."""
     def generate(prompt: str) -> str:
-        probe = TaskRecord(
-            id="__llm_dream_probe__",
-            project="",
-            intent=prompt,
-            reference_kind="none",
-        )
-        return backend.attempt(probe, skill="", memory="")
+        return backend.generate(prompt, max_tokens=1024)
     return generate
+
+
+def backend_fidelity_fn(backend) -> FidelityFn:
+    """Build a full-task semantic verifier routed through the optimizer API."""
+    def verify(task: TaskRecord, candidates: Sequence[str]) -> Sequence[bool]:
+        from skillopt_sleep import prompts as prompt_registry
+
+        task_payload = {
+            "intent": task.intent,
+            "context_excerpt": task.context_excerpt,
+            "reference_kind": task.reference_kind,
+            "reference": task.reference,
+            "judge": task.judge,
+            "system": task.system,
+            "tags": task.tags,
+        }
+        prompt = prompt_registry.render("llm_dream_fidelity", {
+            "__TASK_JSON__": json.dumps(task_payload, ensure_ascii=False, sort_keys=True),
+            "__CANDIDATES_JSON__": json.dumps(list(candidates), ensure_ascii=False),
+        })
+        return _parse_fidelity_decisions(
+            backend.generate(prompt, max_tokens=1024),
+            len(candidates),
+        )
+    return verify
 
 
 # ── associative recall (experience replay of similar past tasks) ──────────────
@@ -249,6 +370,7 @@ def dream_consolidate(
     night: int = 1,
     llm_dream: bool = False,
     generate_fn: Optional[GenerateFn] = None,
+    fidelity_fn: Optional[FidelityFn] = None,
     evidence=None,
 ) -> ConsolidationResult:
     """Recall similar past experience + dream synthetic variants, then run one
@@ -278,6 +400,7 @@ def dream_consolidate(
             factor=dream_factor,
             llm_dream=llm_dream,
             generate_fn=generate_fn,
+            fidelity_fn=fidelity_fn,
             evidence=evidence,
         )
     return consolidate(

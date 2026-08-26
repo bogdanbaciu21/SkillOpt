@@ -148,6 +148,15 @@ def test_explicit_target_is_preserved_when_optimizer_is_default() -> None:
     )
 
 
+def test_claude_code_exec_optimizer_opt_in_is_preserved() -> None:
+    # Route B: the target defaults to Claude Code, but an explicit
+    # --optimizer_backend claude_code_exec still drives both roles.
+    assert _resolve_role_backends("claude_code_exec", "claude_code_exec", "openai_chat") == (
+        "claude_code_exec",
+        "claude_code_exec",
+    )
+
+
 def test_copilot_maps_both_roles_to_the_cli_authenticated_backend() -> None:
     # No separate provider API key is needed because the CLI carries sign-in.
     assert _resolve_role_backends("copilot", *_BASE_CONFIG) == ("copilot_chat", "copilot_chat")

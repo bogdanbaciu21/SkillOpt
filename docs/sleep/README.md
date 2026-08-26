@@ -338,7 +338,14 @@ correctness signal; the validation gate still governs what ships.
 | `dream_rollouts` | `1` | Run each task K times → learn from the good-vs-bad contrast (contrastive reflection). |
 | `recall_k` | `0` | Associative recall — pull the K most-similar past tasks (from a persisted archive) into tonight's dream. |
 | `dream_factor` | `0` | Add N lightweight synthetic variants of each task. |
-| `llm_dream` | `false` | Opt-in paraphrase generator for those variants. Templates stay the default and are used on any parse or fidelity failure. v1 is paraphrase-only: parent `reference`/`judge` are copied unchanged. |
+| `llm_dream` | `false` | Opt-in optimizer-side paraphrase generator and task-aware semantic verifier. Templates stay the default and are used on any generation, parse, deterministic, or semantic-fidelity failure. v1 is paraphrase-only: parent `reference`/`judge` are copied unchanged, generated tasks stay train-only, and target replay is untouched. |
+
+The recorded end-to-end fixture in `tests/test_llm_dream.py` exercises one
+accepted and one rejected candidate (50% acceptance / 50% fallback), accounts
+optimizer generation usage while confirming zero target-generation usage, and
+checks that the held-out candidate score does not regress from the template
+control. It is deterministic CI evidence, not a claim about any live provider's
+semantic quality or pricing.
 
 ## Results
 
