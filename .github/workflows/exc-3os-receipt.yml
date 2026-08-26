@@ -1,7 +1,7 @@
-name: exc-3os-baseline-receipt
+name: exc-final-3os-validation
 
-# Fork-only control run for current microsoft/SkillOpt main. This workflow
-# never appears in either feature PR diff.
+# Fork-only validation receipt. This workflow is intentionally kept off the
+# feature branches so it never appears in the upstream PR diffs.
 on:
   workflow_dispatch:
   push:
@@ -11,14 +11,23 @@ permissions:
   contents: read
 
 jobs:
-  upstream-baseline:
+  full-suite:
+    name: ${{ matrix.target.name }} / ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
-    name: upstream main / ${{ matrix.os }}
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        target:
+          - name: pr242
+            branch: verify/pr242-97e70b5
+            sha: 97e70b5c8c766e5c0492902ec4e14baf1fcd8119
+            focused: tests/test_evalkit.py
+          - name: pr244
+            branch: verify/pr244-de5e56f
+            sha: de5e56fef8baa5feba91d314d30395372e40b72b
+            focused: tests/test_llm_dream.py tests/test_sleep_evidence.py
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -26,34 +35,56 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Clone immutable upstream control
+
+      - name: Clone and verify immutable candidate
         env:
-          BRANCH: verify/upstream-0389ace
-          EXPECTED: 0389ace56339988e16ca5ddab36f0978776fe9b0
+          BRANCH: ${{ matrix.target.branch }}
+          EXPECTED_SHA: ${{ matrix.target.sha }}
         run: |
           set -euo pipefail
           git clone --quiet --depth 1 --branch "$BRANCH" https://github.com/bogdanbaciu21/SkillOpt skillopt
           cd skillopt
-          HEAD_SHA=$(git rev-parse HEAD)
-          echo "CONTROL=upstream-main"
-          echo "PLATFORM=$(uname -srm)"
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          echo "platform=$(uname -srm)"
           python --version
-          echo "BRANCH=$BRANCH"
-          echo "BRANCH_HEAD=$HEAD_SHA"
-          echo "EXPECTED_HEAD=$EXPECTED"
-          test "$HEAD_SHA" = "$EXPECTED"
-      - name: Install complete test environment
+          echo "branch=$BRANCH"
+          echo "expected_sha=$EXPECTED_SHA"
+          echo "actual_sha=$ACTUAL_SHA"
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA"
+
+      - name: Install development test environment
         run: |
           set -euo pipefail
           cd skillopt
           python -m venv .venv
-          if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=.venv/Scripts/python; fi
-          "$PY" -m pip install -q -e ".[dev]" pytest-timeout
-          "$PY" -m pytest --collect-only -q
+          if [ -x .venv/Scripts/python.exe ]; then
+            PY=.venv/Scripts/python.exe
+          else
+            PY=.venv/bin/python
+          fi
+          "$PY" -m pip install --disable-pip-version-check -q -e ".[dev]" pytest-timeout
+          "$PY" --version
+
+      - name: Run focused feature regressions
+        env:
+          FOCUSED: ${{ matrix.target.focused }}
+        run: |
+          set -euo pipefail
+          cd skillopt
+          if [ -x .venv/Scripts/python.exe ]; then
+            PY=.venv/Scripts/python.exe
+          else
+            PY=.venv/bin/python
+          fi
+          "$PY" -m pytest $FOCUSED -q
+
       - name: Run entire repository test suite
         run: |
           set -euo pipefail
           cd skillopt
-          if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=.venv/Scripts/python; fi
+          if [ -x .venv/Scripts/python.exe ]; then
+            PY=.venv/Scripts/python.exe
+          else
+            PY=.venv/bin/python
+          fi
           "$PY" -m pytest -q -rf --timeout=120 --timeout-method=thread
-          echo "PYTEST_RC=0"
