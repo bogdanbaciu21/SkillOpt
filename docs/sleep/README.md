@@ -350,8 +350,8 @@ success-rate delta. The nightly gate is unchanged.
 python -m skillopt_sleep.evalkit --manifest tasks.json --a cond_a.json --b cond_b.json
 ```
 
-See [`evalkit.md`](evalkit.md) for the id-set contract, multi-seed bands, the
-A/A calibration, and the published RESULTS cell replay.
+See [`evalkit.md`](evalkit.md) for the id-set contract, task-cluster multi-seed
+inference, A/A checks, and the published RESULTS cell replay.
 
 ## Results
 

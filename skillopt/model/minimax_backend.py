@@ -70,6 +70,34 @@ TARGET_DEPLOYMENT = os.environ.get(
     default_model_for_backend("minimax_chat"),
 )
 
+# Models whose thinking cannot actually be turned off. Per MiniMax's
+# OpenAI-compatible docs the M2.x family accepts ``{"type": "disabled"}`` but
+# keeps thinking on regardless, so sending "disabled" there is a lie we would
+# then have to reason about downstream. Send the honest value instead.
+_ALWAYS_THINKING_PREFIXES: tuple[str, ...] = ("MiniMax-M2",)
+
+
+def _thinking_is_forced(deployment: str) -> bool:
+    """True when ``deployment`` cannot honor ``thinking: {"type": "disabled"}``."""
+    name = str(deployment or "").strip()
+    return any(name.startswith(prefix) for prefix in _ALWAYS_THINKING_PREFIXES)
+
+
+def _resolve_thinking_type(deployment: str) -> str:
+    """Return the documented top-level ``thinking.type`` for ``deployment``.
+
+    MiniMax documents thinking control as a top-level ``thinking`` object --
+    ``{"thinking": {"type": "adaptive"}}`` or ``{"thinking": {"type":
+    "disabled"}}`` -- NOT as ``chat_template_kwargs.enable_thinking``, which is
+    a Qwen/HuggingFace-serving convention that this endpoint simply ignores.
+    Unknown deployments are treated as capable of adaptive thinking, matching
+    the API default (thinking on when the parameter is omitted).
+    """
+    if _thinking_is_forced(deployment):
+        return "adaptive"
+    return "adaptive" if ENABLE_THINKING else "disabled"
+
+
 _config_lock = threading.Lock()
 tracker = TokenTracker()
 
@@ -177,7 +205,9 @@ def _chat_messages_impl(
         "messages": _json_safe(messages),
         "max_tokens": min(max_completion_tokens, MAX_TOKENS),
     }
-    payload["chat_template_kwargs"] = {"enable_thinking": ENABLE_THINKING}
+    payload["thinking"] = {
+        "type": _resolve_thinking_type(deployment or TARGET_DEPLOYMENT)
+    }
     if TEMPERATURE is not None:
         payload["temperature"] = TEMPERATURE
     if tools:
