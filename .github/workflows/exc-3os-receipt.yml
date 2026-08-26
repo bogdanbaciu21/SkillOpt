@@ -20,8 +20,8 @@ jobs:
         target:
           - name: platform-baseline
             branch: verify/common-platform-ab236c6
-            sha: 68ae4fbe1103a954c52892590a1a0b207c662689
-            focused: tests/test_sleep_adopt_skill_subset.py::TestDurableAdoptionTransaction::test_restart_cleans_own_hardlink_publication_temp -s
+            sha: 2a1e97499885264b65c34cd0d2f05444c7ef440b
+            focused: tests/test_sleep_adopt_skill_subset.py::TestDurableAdoptionTransaction::test_restart_cleans_own_hardlink_publication_temp
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:
