@@ -1,7 +1,7 @@
-name: exc-3os-receipt
+name: exc-3os-baseline-receipt
 
-# Fork-only 3-OS receipts for immutable verification commits. This workflow
-# never appears in the microsoft/SkillOpt feature PR diffs.
+# Fork-only control run for current microsoft/SkillOpt main. This workflow
+# never appears in either feature PR diff.
 on:
   workflow_dispatch:
   push:
@@ -11,21 +11,12 @@ permissions:
   contents: read
 
 jobs:
-  full-suite:
+  upstream-baseline:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        case:
-          - pr: "242"
-            branch: verify/pr242-eb845b6
-            expected: eb845b6bc13e868308faa39c837722657fd09b76
-            wiring: tests/test_evalkit.py
-          - pr: "244"
-            branch: verify/pr244-c48d938
-            expected: c48d93874dff42f4ae845292a7ce6e0f4a86fd10
-            wiring: tests/test_llm_dream.py
-    name: PR ${{ matrix.case.pr }} / ${{ matrix.os }}
+        os: [windows-latest, macos-latest]
+    name: upstream main / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     defaults:
@@ -35,16 +26,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Clone immutable verification branch
+      - name: Clone immutable upstream control
         env:
-          BRANCH: ${{ matrix.case.branch }}
-          EXPECTED: ${{ matrix.case.expected }}
+          BRANCH: verify/upstream-0389ace
+          EXPECTED: 0389ace56339988e16ca5ddab36f0978776fe9b0
         run: |
           set -euo pipefail
           git clone --quiet --depth 1 --branch "$BRANCH" https://github.com/bogdanbaciu21/SkillOpt skillopt
           cd skillopt
           HEAD_SHA=$(git rev-parse HEAD)
-          echo "PR=${{ matrix.case.pr }}"
+          echo "CONTROL=upstream-main"
           echo "PLATFORM=$(uname -srm)"
           python --version
           echo "BRANCH=$BRANCH"
@@ -59,14 +50,6 @@ jobs:
           if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=.venv/Scripts/python; fi
           "$PY" -m pip install -q -e ".[dev]" pytest-timeout
           "$PY" -m pytest --collect-only -q
-      - name: Run focused wiring check
-        env:
-          WIRING: ${{ matrix.case.wiring }}
-        run: |
-          set -euo pipefail
-          cd skillopt
-          if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=.venv/Scripts/python; fi
-          "$PY" -m pytest "$WIRING" -q
       - name: Run entire repository test suite
         run: |
           set -euo pipefail
