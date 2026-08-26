@@ -1919,35 +1919,6 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
                 os.link(backup, alias)
             except OSError:
                 self.skipTest("hard links unavailable")
-            if os.name == "nt":
-                backup_info = os.lstat(backup)
-                alias_info = os.lstat(alias)
-                print(
-                    "WINDOWS_HARDLINK_DIAG",
-                    {
-                        "staging": night.staging,
-                        "staging_real": os.path.realpath(night.staging),
-                        "backup": backup,
-                        "backup_real": os.path.realpath(backup),
-                        "backup_id": (backup_info.st_dev, backup_info.st_ino),
-                        "backup_nlink": backup_info.st_nlink,
-                        "alias_id": (alias_info.st_dev, alias_info.st_ino),
-                        "alias_nlink": alias_info.st_nlink,
-                        "contained": staging_mod._existing_path_is_canonical_staging_descendant(
-                            backup,
-                            night.staging,
-                        ),
-                        "entries": [
-                            (
-                                entry.name,
-                                entry.stat(follow_symlinks=False).st_dev,
-                                entry.stat(follow_symlinks=False).st_ino,
-                                entry.stat(follow_symlinks=False).st_nlink,
-                            )
-                            for entry in os.scandir(os.path.dirname(backup))
-                        ],
-                    },
-                )
             adopt_skills(night.staging, ["alpha"])
             self.assertFalse(os.path.lexists(alias))
             self.assertFalse(os.path.lexists(os.path.join(

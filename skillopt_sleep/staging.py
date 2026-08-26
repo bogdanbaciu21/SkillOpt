@@ -547,7 +547,10 @@ def _remove_private_temp_aliases(path: str) -> None:
         if not entry.name.startswith(".tmp-new-") or entry.path == path:
             continue
         try:
-            candidate = entry.stat(follow_symlinks=False)
+            # ``DirEntry.stat()`` reports zeroed file IDs/link counts on the
+            # Windows GitHub runner.  A path-based lstat returns the actual
+            # NTFS identity and keeps the hard-link comparison meaningful.
+            candidate = os.lstat(entry.path)
             if (
                 stat.S_ISREG(candidate.st_mode)
                 and (candidate.st_dev, candidate.st_ino) == file_id
