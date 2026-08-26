@@ -32,6 +32,10 @@ def _proposal(name="example-skill", body="# example\n", live=None, root="/tmp/li
     return SkillProposal(name, body, live)
 
 
+def _canonical(path):
+    return os.path.realpath(os.path.abspath(os.path.normpath(path)))
+
+
 def _report():
     return SleepReport(night=1, project="/repo/example", accepted=True,
                        gate_action="accept_new_best")
@@ -44,7 +48,7 @@ class TestSkillProposalRows(unittest.TestCase):
         self.assertEqual([r["proposed_file"] for r in rows],
                          ["proposed_SKILL.alpha.md", "proposed_SKILL.beta.md"])
         self.assertEqual(rows[0]["live_skill_path"],
-                         os.path.normpath("/tmp/live/alpha/SKILL.md"))
+                         _canonical("/tmp/live/alpha/SKILL.md"))
         self.assertEqual(
             rows[0]["sha256"],
             hashlib.sha256(b"# example\n").hexdigest(),
@@ -126,14 +130,14 @@ class TestSkillProposalRows(unittest.TestCase):
         # duplicate separators everywhere, and every forward-slash absolute
         # path on Windows. Normalising first keeps the traversal guard.
         rows = skill_proposal_rows([_proposal("alpha", live="/tmp/live//alpha/SKILL.md")])
-        self.assertEqual(rows[0]["live_skill_path"], os.path.normpath("/tmp/live/alpha/SKILL.md"))
+        self.assertEqual(rows[0]["live_skill_path"], _canonical("/tmp/live/alpha/SKILL.md"))
 
     def test_current_directory_segments_are_normalised_not_refused(self):
         rows = skill_proposal_rows([
             _proposal("alpha", live="/tmp/live/./alpha/SKILL.md")
         ])
         self.assertEqual(rows[0]["live_skill_path"],
-                         os.path.normpath("/tmp/live/alpha/SKILL.md"))
+                         _canonical("/tmp/live/alpha/SKILL.md"))
 
     def test_two_skills_targeting_one_file_are_refused(self):
         shared = "/tmp/live/shared/SKILL.md"
@@ -297,7 +301,7 @@ class TestWriteStagingCompatibility(unittest.TestCase):
             rows = self._manifest(out)["skills"]
             self.assertEqual([r["skill_name"] for r in rows], ["alpha", "beta"])
             self.assertEqual(rows[1]["live_skill_path"],
-                             os.path.join(live_root, "beta", "SKILL.md"))
+                             _canonical(os.path.join(live_root, "beta", "SKILL.md")))
             self.assertEqual(
                 rows[0]["sha256"],
                 hashlib.sha256(b"# alpha\n").hexdigest(),

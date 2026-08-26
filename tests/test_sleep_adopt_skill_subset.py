@@ -34,13 +34,13 @@ def _sha(text):
 
 
 def _read(path):
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8", newline="") as f:
         return f.read()
 
 
 def _write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(text)
 
 
@@ -54,6 +54,7 @@ class TwoSkillNight:
         alpha_body="# alpha v1\n",
         beta_body="# beta v1\n",
     ):
+        tmp = os.path.realpath(tmp)
         self.tmp = tmp
         self.live_root = os.path.join(tmp, "live")
         self.alpha_live = os.path.join(self.live_root, "alpha", "SKILL.md")
@@ -96,7 +97,7 @@ class TestAdoptionIsConfinedToTheStagedRoots(unittest.TestCase):
         for row in manifest["skills"]:
             if row["skill_name"] == skill_name:
                 row["live_skill_path"] = new_live
-                row["live_realpath"] = new_live
+                row["live_realpath"] = os.path.realpath(new_live)
                 if row.get("live_sha256"):
                     if os.path.exists(new_live):
                         with open(new_live, "rb") as h:
@@ -324,6 +325,8 @@ class TestAdoptSkillSubset(unittest.TestCase):
             self.assertEqual(_read(night.alpha_live), "# alpha v1\n")
 
     def test_adoption_preserves_existing_live_file_mode(self):
+        if os.name == "nt":
+            self.skipTest("Windows does not provide POSIX file-mode semantics")
         with tempfile.TemporaryDirectory() as tmp:
             night = TwoSkillNight(tmp)
             os.chmod(night.alpha_live, 0o640)
@@ -543,6 +546,8 @@ class TestAdoptSkillSubset(unittest.TestCase):
             self.assertEqual(_read(backup_path), backup_before)
 
     def test_rollback_restores_original_mode_as_well_as_bytes(self):
+        if os.name == "nt":
+            self.skipTest("Windows does not provide POSIX file-mode semantics")
         from skillopt_sleep import staging as staging_mod
 
         with tempfile.TemporaryDirectory() as tmp:

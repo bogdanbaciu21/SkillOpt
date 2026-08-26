@@ -1375,7 +1375,9 @@ class TestFullCycleAndAdopt(unittest.TestCase):
 
     def test_cycle_can_target_repo_scoped_skill_path(self):
         with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
-            target = os.path.abspath(os.path.join(proj, ".agents/skills/taste-skill/SKILL.md"))
+            target = os.path.realpath(
+                os.path.abspath(os.path.join(proj, ".agents/skills/taste-skill/SKILL.md"))
+            )
             cfg = load_config(
                 invoked_project=proj,
                 projects="invoked",

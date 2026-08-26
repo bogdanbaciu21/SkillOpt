@@ -1,13 +1,12 @@
 """Tests for Superpowers skill evaluation (offline, no API)."""
 import os
+import re as _re
 import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-import re as _re
 
 from skillopt_sleep.adapters.superpowers import (
     VERIFICATION_SCENARIOS,
@@ -184,6 +183,7 @@ class TestJudgeLogic:
         assert _score_check(check, "Not all tests pass - test_two failed.") is True
 
 
+@pytest.mark.skipif(os.name != "posix", reason="harness evidence uses POSIX shims")
 class TestHarnessEvidence:
     """Harness-collected evidence used for trusted-candidate evaluation."""
 
@@ -455,6 +455,7 @@ class TestHarnessEvidence:
             }
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Superpowers adapter requires POSIX bash")
 class TestOverlayIntegration:
     """Mocked tests proving skill overlay and bootstrap are set up correctly."""
 
@@ -692,6 +693,7 @@ class TestOverlayIntegration:
             assert mock_run.call_count == 1
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Superpowers adapter requires POSIX bash")
 class TestIsolation:
     """Host credentials must not leak into the scenario environment."""
 
@@ -828,6 +830,7 @@ class TestIsolation:
             assert "/custom/claude" in mock_run.call_args[0][0]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Superpowers adapter requires POSIX bash")
 class TestCLIFailClosed:
     """Tests for CLI fail-closed behavior."""
 
@@ -935,6 +938,7 @@ class TestCLIFailClosed:
                     _run_git_step(["fetch", "origin"], Path(tmpdir), timeout=12)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Superpowers adapter requires POSIX bash")
 class TestPermissionModes:
     """Tests for permission handling in cmd construction."""
 

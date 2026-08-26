@@ -458,7 +458,18 @@ def _write_atomic_bytes(
                 else:
                     os.chmod(tmp, existing_mode)
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        # Windows can transiently deny a replace when another publisher has
+        # just replaced the same destination and the filesystem has not yet
+        # released its handle. Keep the operation atomic and bounded; never
+        # fall back to unlink-then-rename, which would expose a missing pointer.
+        for attempt in range(20):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 19:
+                    raise
+                time.sleep(0.005 * (attempt + 1))
         _fsync_parent(path)
     except BaseException:
         try:
