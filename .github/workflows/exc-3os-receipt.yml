@@ -19,12 +19,12 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         target:
           - name: pr242-final
-            branch: verify/pr242-final-7686629
-            sha: 76866294a8045c2fe80880ffdc1212df90f8883f
+            branch: verify/pr242-merge-final-7c97a99
+            sha: 7c97a9915d0f614a5c016fec20db29bd3af71f42
             focused: tests/test_evalkit.py tests/test_sleep_staging_fanout.py tests/test_sleep_adopt_skill_subset.py
           - name: pr244-final
-            branch: verify/pr244-final-9ef4da3
-            sha: 9ef4da31318b794e818cc68bbd7677ae70fa8ae7
+            branch: verify/pr244-merge-final-09d8cef
+            sha: 09d8cef1ea2a6c0a4b21bf7527b1360bab666c93
             focused: tests/test_llm_dream.py tests/test_sleep_engine.py tests/test_backend_opencode.py tests/test_backend_pi.py tests/test_plugin_sync.py tests/test_sleep_staging_fanout.py
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
