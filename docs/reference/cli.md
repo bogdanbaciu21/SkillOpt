@@ -126,8 +126,9 @@ python -m skillopt_sleep <action> [options]
 Actions are `run`, `dry-run`, `status`, `adopt`, `harvest`, `schedule`,
 `unschedule`, and `evalkit`. `evalkit` is also available as
 `python -m skillopt_sleep.evalkit` and compares two conditions on one fixed
-task manifest (McNemar + bootstrap CI). See `docs/sleep/evalkit.md`. Common
-options for the nightly actions include:
+task manifest (McNemar + bootstrap CI). Exactly one of its `--b` comparison
+input or `--aa` identity-check flag is required. See `docs/sleep/evalkit.md`.
+Common options for the nightly actions include:
 
 | Argument | Description |
 |---|---|

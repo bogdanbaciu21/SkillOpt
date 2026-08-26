@@ -888,8 +888,8 @@ def main(argv=None) -> int:
     )
     p_eval.add_argument("--manifest", required=True)
     p_eval.add_argument("--a", required=True)
-    p_eval.add_argument("--b", default="")
-    p_eval.add_argument("--aa", action="store_true")
+    p_eval.add_argument("--b", default=None, help="required unless --aa")
+    p_eval.add_argument("--aa", action="store_true", help="mutually exclusive with --b")
     p_eval.add_argument("--alpha", type=float, default=0.05)
     p_eval.add_argument("--boot", type=int, default=10000)
     p_eval.add_argument("--seed", type=int, default=42)
@@ -914,7 +914,7 @@ def main(argv=None) -> int:
     if args.cmd == "evalkit":
         from skillopt_sleep.evalkit import main as evalkit_main
         argv = ["--manifest", args.manifest, "--a", args.a]
-        if args.b:
+        if args.b is not None:
             argv.extend(["--b", args.b])
         if args.aa:
             argv.append("--aa")

@@ -36,14 +36,16 @@ class EvalkitError(ValueError):
 
 
 MAX_BOOTSTRAPS = 1_000_000
+MAX_BOOTSTRAP_DRAWS = 50_000_000
+MAX_MCNEMAR_DISCORDANTS = 1_000_000
 
 
 def _validate_alpha(alpha: float) -> float:
-    if isinstance(alpha, bool):
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
         raise EvalkitError("alpha must be a finite number strictly between 0 and 1")
     try:
         value = float(alpha)
-    except (TypeError, ValueError, OverflowError):
+    except OverflowError:
         raise EvalkitError("alpha must be a finite number strictly between 0 and 1") from None
     if not math.isfinite(value) or not 0.0 < value < 1.0:
         raise EvalkitError("alpha must be a finite number strictly between 0 and 1")
@@ -167,16 +169,24 @@ def exact_mcnemar_p(b: int, c: int) -> float:
     n = b + c
     if n == 0:
         return 1.0
+    if n > MAX_MCNEMAR_DISCORDANTS:
+        raise EvalkitError(
+            "exact McNemar workload exceeds the "
+            f"{MAX_MCNEMAR_DISCORDANTS} discordant-pair limit"
+        )
     k = min(b, c)
     # Start at the largest term in the requested lower tail, then recur
     # downward. This avoids both the enormous int-to-float conversion in
     # comb(n, k) * 0.5**n and loss from starting at an underflowed 2**-n.
-    term = _binom_pmf(k, n, 0.5)
-    terms = [term]
-    for i in range(k, 0, -1):
-        term *= i / (n - i + 1)
-        terms.append(term)
-    tail = math.fsum(terms)
+    def lower_tail_terms() -> Iterable[float]:
+        # Feed fsum lazily so memory stays bounded independently of k.
+        term = _binom_pmf(k, n, 0.5)
+        yield term
+        for i in range(k, 0, -1):
+            term *= i / (n - i + 1)
+            yield term
+
+    tail = math.fsum(lower_tail_terms())
     return min(1.0, 2.0 * tail)
 
 
@@ -194,7 +204,14 @@ def mcnemar_from_counts(
     b_only = _validate_count("b_only", b_only)
     both_fail = _validate_count("both_fail", both_fail)
     n = both_success + a_only + b_only + both_fail
+    if n == 0:
+        raise EvalkitError("McNemar requires at least one paired observation")
     disc = a_only + b_only
+    if disc > MAX_MCNEMAR_DISCORDANTS:
+        raise EvalkitError(
+            "exact McNemar workload exceeds the "
+            f"{MAX_MCNEMAR_DISCORDANTS} discordant-pair limit"
+        )
     if disc == 0:
         chi2 = 0.0
         p_chi2 = 1.0
@@ -247,23 +264,34 @@ def bootstrap_delta_ci(
     seed = _validate_seed(seed)
     if len(a) != len(b) or not a:
         raise EvalkitError("bootstrap requires a non-empty paired sample")
-    numeric_a: List[float] = []
-    numeric_b: List[float] = []
+    n = len(a)
+    if n_boot > MAX_BOOTSTRAP_DRAWS // n:
+        raise EvalkitError(
+            "bootstrap workload exceeds the "
+            f"{MAX_BOOTSTRAP_DRAWS} paired-draw limit (n_tasks * n_boot)"
+        )
+    if any(
+        isinstance(x, bool) or not isinstance(x, (int, float))
+        for values in (a, b)
+        for x in values
+    ):
+        raise EvalkitError("bootstrap scores must be JSON numbers, not booleans or strings")
     try:
         numeric_a = [float(x) for x in a]
         numeric_b = [float(x) for x in b]
-    except (TypeError, ValueError, OverflowError):
+    except OverflowError:
         raise EvalkitError("bootstrap scores must be numeric and finite") from None
     if any(not math.isfinite(x) for x in numeric_a + numeric_b):
         raise EvalkitError("bootstrap scores must be numeric and finite")
+    if any(not 0.0 <= x <= 1.0 for x in numeric_a + numeric_b):
+        raise EvalkitError("bootstrap scores must be between 0 and 1")
     rng = random.Random(seed)
-    n = len(a)
+    paired_deltas = [right - left for left, right in zip(numeric_a, numeric_b)]
     deltas: List[float] = []
     for _ in range(n_boot):
-        idx = [rng.randrange(n) for _ in range(n)]
-        da = sum(numeric_a[i] for i in idx) / n
-        db = sum(numeric_b[i] for i in idx) / n
-        deltas.append(db - da)
+        deltas.append(
+            math.fsum(paired_deltas[rng.randrange(n)] for _ in range(n)) / n
+        )
     deltas.sort()
     # Inclusive percentile on the sorted sample.
     lo_i = int(math.floor((alpha / 2.0) * (n_boot - 1)))
@@ -283,40 +311,65 @@ def bootstrap_delta_ci(
 # ── pairing / loading ─────────────────────────────────────────────────────────
 
 def _as_binary(value: Any) -> Optional[int]:
-    if value is True or value == 1 or value == 1.0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value == 1 or value == 1.0:
         return 1
-    if value is False or value == 0 or value == 0.0:
+    if value == 0 or value == 0.0:
         return 0
     return None
 
 
+def _task_id(value: Any, *, context: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise EvalkitError(f"{context} task ids must be non-empty JSON strings")
+    return value
+
+
+def _display_task_id(value: str) -> str:
+    display = value if len(value) <= 80 else value[:77] + "..."
+    return repr(display)
+
+
+def _score(value: Any, *, task_id: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise EvalkitError(
+            f"task {_display_task_id(task_id)} scores must be JSON numbers, "
+            "not booleans or strings"
+        )
+    try:
+        score = float(value)
+    except OverflowError:
+        raise EvalkitError(
+            f"task {_display_task_id(task_id)} scores must be finite and between 0 and 1"
+        ) from None
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        raise EvalkitError(
+            f"task {_display_task_id(task_id)} scores must be finite and between 0 and 1"
+        )
+    return score
+
+
 def _normalize_outcomes(raw: Mapping[str, Any]) -> Dict[str, List[float]]:
-    """Map task id -> list of per-seed scores (length 1 if unseeded)."""
+    """Map task id -> positional repeat scores (length 1 if unseeded)."""
     if not isinstance(raw, Mapping):
         raise EvalkitError("outcomes must be a JSON object keyed by task id")
     out: Dict[str, List[float]] = {}
     for tid, val in raw.items():
-        key = str(tid)
-        if key in out:
-            raise EvalkitError(f"duplicate outcome task id after normalization: {key}")
-        if isinstance(val, Mapping) and "seeds" in val:
+        key = _task_id(tid, context="outcome")
+        if isinstance(val, Mapping):
+            if set(val) != {"seeds"} or not isinstance(val["seeds"], list):
+                raise EvalkitError(
+                    f"task {_display_task_id(key)} must contain only a seeds array"
+                )
             val = val["seeds"]
         if isinstance(val, (list, tuple)):
             values = list(val)
         else:
             values = [val]
         if not values:
-            raise EvalkitError(f"task {key} has an empty seed list")
-        normalized: List[float] = []
-        for item in values:
-            try:
-                score = float(item)
-            except (TypeError, ValueError, OverflowError):
-                raise EvalkitError(f"task {key} contains a non-numeric score") from None
-            if not math.isfinite(score) or not 0.0 <= score <= 1.0:
-                raise EvalkitError(f"task {key} scores must be finite and between 0 and 1")
-            normalized.append(score)
-        out[key] = normalized
+            raise EvalkitError(f"task {_display_task_id(key)} has an empty seed list")
+        out[key] = [_score(item, task_id=key) for item in values]
     return out
 
 
@@ -326,7 +379,9 @@ def align_pairs(
     outcomes_b: Mapping[str, Any],
 ) -> Tuple[List[str], List[List[float]], List[List[float]]]:
     """Align A and B onto the manifest. Refuse any id-set mismatch."""
-    ids = [str(i) for i in manifest_ids]
+    if isinstance(manifest_ids, (str, bytes)) or not isinstance(manifest_ids, Sequence):
+        raise EvalkitError("manifest task ids must be a JSON array")
+    ids = [_task_id(item, context="manifest") for item in manifest_ids]
     if not ids:
         raise EvalkitError("manifest is empty")
     if len(ids) != len(set(ids)):
@@ -380,10 +435,15 @@ def reconstruct_paired_from_rates(n: int, rate_a: float, rate_b: float) -> Tuple
     """
     if isinstance(n, bool) or not isinstance(n, int) or n < 1:
         raise EvalkitError("n must be >= 1")
+    if any(
+        isinstance(rate, bool) or not isinstance(rate, (int, float))
+        for rate in (rate_a, rate_b)
+    ):
+        raise EvalkitError("rates must be JSON numbers, finite, and between 0 and 1")
     try:
         numeric_a, numeric_b = float(rate_a), float(rate_b)
-    except (TypeError, ValueError, OverflowError):
-        raise EvalkitError("rates must be numeric, finite, and between 0 and 1") from None
+    except OverflowError:
+        raise EvalkitError("rates must be finite and between 0 and 1") from None
     if not all(math.isfinite(rate) and 0.0 <= rate <= 1.0 for rate in (numeric_a, numeric_b)):
         raise EvalkitError("rates must be finite and between 0 and 1")
     ka = int(round(n * numeric_a))
@@ -405,6 +465,8 @@ def compare(
 ) -> EvalReport:
     alpha = _validate_alpha(alpha)
     n_boot = _validate_bootstraps(n_boot)
+    if not isinstance(allow_graded, bool):
+        raise EvalkitError("allow_graded must be a boolean")
     ids, a_rows, b_rows = align_pairs(manifest_ids, outcomes_a, outcomes_b)
     n_seed = len(a_rows[0])
     notes: List[str] = []
@@ -446,13 +508,18 @@ def compare(
         for s in range(n_seed):
             da = _mean(row[s] for row in a_rows)
             db = _mean(row[s] for row in b_rows)
-            per_seed.append({"seed": s, "rate_a": da, "rate_b": db, "delta": db - da})
+            per_seed.append(
+                {"seed_index": s, "rate_a": da, "rate_b": db, "delta": db - da}
+            )
         deltas = [row["delta"] for row in per_seed]
         seed_mean = _mean(deltas)
         seed_sd = _sd(deltas)
         notes.append(
-            f"multi-seed: {n_seed} repeats; seed-mean delta={seed_mean:.6f} "
-            f"sd={seed_sd:.6f}"
+            f"multi-seed positional repeats: {n_seed}; mean delta={seed_mean:.6f} "
+            f"sample sd={seed_sd:.6f}; descriptive only, not an uncertainty estimate"
+        )
+        notes.append(
+            "seed lists are positional repeats; seed_index is not a verified RNG seed id"
         )
 
     return EvalReport(
@@ -482,53 +549,87 @@ def compare_aa(
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
 
-def _load_json(path: str) -> Any:
+def _reject_duplicate_object_keys(pairs: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
+    obj: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in obj:
+            display_key = key if len(key) <= 80 else key[:77] + "..."
+            raise EvalkitError(f"duplicate JSON object key: {display_key!r}")
+        obj[key] = value
+    return obj
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise EvalkitError(f"non-standard JSON constant {value} is not allowed")
+
+
+def _load_json(path: str, *, label: str) -> Any:
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, UnicodeError) as exc:
-        raise EvalkitError(f"invalid JSON in {path}: {exc}") from None
+            return json.load(
+                f,
+                object_pairs_hook=_reject_duplicate_object_keys,
+                parse_constant=_reject_json_constant,
+            )
+    except EvalkitError as exc:
+        raise EvalkitError(f"invalid JSON in {label}: {exc}") from None
+    except (json.JSONDecodeError, UnicodeError, ValueError, RecursionError) as exc:
+        if isinstance(exc, json.JSONDecodeError):
+            detail = exc.msg
+        elif isinstance(exc, UnicodeError):
+            detail = "invalid text encoding"
+        elif isinstance(exc, RecursionError):
+            detail = "nesting is too deep"
+        else:
+            detail = "invalid numeric literal"
+        raise EvalkitError(f"invalid JSON in {label}: {detail}") from None
+    except OSError as exc:
+        detail = exc.strerror or type(exc).__name__
+        raise EvalkitError(f"could not read {label}: {detail}") from None
 
 
 def _manifest_ids(obj: Any) -> List[str]:
     if isinstance(obj, list):
-        return [str(x) for x in obj]
+        return [_task_id(item, context="manifest") for item in obj]
     if isinstance(obj, Mapping):
+        forms = [name for name in ("ids", "tasks", "outcomes") if name in obj]
+        if len(forms) > 1:
+            raise EvalkitError("manifest must use exactly one of ids, tasks, or outcomes")
         if "ids" in obj:
             values = obj["ids"]
             if not isinstance(values, list):
                 raise EvalkitError("manifest ids must be a JSON array")
-            return [str(x) for x in values]
+            return [_task_id(item, context="manifest") for item in values]
         if "tasks" in obj:
             tasks = obj["tasks"]
             if not isinstance(tasks, list):
                 raise EvalkitError("manifest tasks must be a JSON array")
             ids: List[str] = []
             for task in tasks:
-                if isinstance(task, Mapping):
-                    if "id" not in task:
-                        raise EvalkitError("every manifest task object must contain id")
-                    ids.append(str(task["id"]))
-                else:
-                    ids.append(str(task))
+                if not isinstance(task, Mapping) or "id" not in task:
+                    raise EvalkitError("every manifest task must be an object containing id")
+                ids.append(_task_id(task["id"], context="manifest"))
             return ids
         if "outcomes" in obj:
             outcomes = obj["outcomes"]
             if not isinstance(outcomes, Mapping):
                 raise EvalkitError("manifest outcomes must be a JSON object")
-            return [str(k) for k in outcomes]
+            return [_task_id(key, context="manifest") for key in outcomes]
     raise EvalkitError("manifest must be a list of ids or an object with ids/tasks")
 
 
-def _outcomes(obj: Any) -> Dict[str, Any]:
-    if isinstance(obj, Mapping) and "outcomes" in obj:
-        values = obj["outcomes"]
-        if not isinstance(values, Mapping):
-            raise EvalkitError("outcomes must be a JSON object keyed by task id")
-        return dict(values)
-    if isinstance(obj, Mapping):
+def _outcomes(obj: Any, manifest_ids: Sequence[str]) -> Dict[str, Any]:
+    if not isinstance(obj, Mapping):
+        raise EvalkitError("outcomes file must be an object mapping task id to score")
+    # A direct mapping wins when its keys exactly match the manifest. This makes
+    # a task literally named ``outcomes`` unambiguous even when its score is a
+    # seeded object. Otherwise the one-key wrapper is recognized.
+    if set(obj) == set(manifest_ids):
         return dict(obj)
-    raise EvalkitError("outcomes file must be an object mapping task id to score")
+    if set(obj) == {"outcomes"} and isinstance(obj["outcomes"], Mapping):
+        values = obj["outcomes"]
+        return dict(values)
+    return dict(obj)
 
 
 def format_markdown(report: EvalReport) -> str:
@@ -540,7 +641,7 @@ def format_markdown(report: EvalReport) -> str:
         f"- rate_b: {report.rate_b:.6f}",
         f"- delta (B-A): {report.delta:+.6f}",
         (
-            f"- bootstrap {int((1 - report.bootstrap.alpha) * 100)}% CI: "
+            f"- bootstrap {100 * (1 - report.bootstrap.alpha):g}% CI: "
             f"[{report.bootstrap.low:+.6f}, {report.bootstrap.high:+.6f}] "
             f"(n_boot={report.bootstrap.n_boot}, seed={report.bootstrap.seed})"
         ),
@@ -557,8 +658,9 @@ def format_markdown(report: EvalReport) -> str:
         )
     if report.seed_mean_delta is not None:
         lines.append(
-            f"- multi-seed mean delta: {report.seed_mean_delta:+.6f} "
-            f"(sd {report.seed_sd_delta:.6f}, k={len(report.per_seed)})"
+            f"- positional-repeat mean delta: {report.seed_mean_delta:+.6f} "
+            f"(descriptive sample sd {report.seed_sd_delta:.6f}, "
+            f"k={len(report.per_seed)}; not an uncertainty estimate)"
         )
     for note in report.notes:
         lines.append(f"- note: {note}")
@@ -572,8 +674,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     p.add_argument("--manifest", required=True, help="JSON list of task ids (or {ids,tasks})")
     p.add_argument("--a", required=True, help="JSON outcomes for condition A")
-    p.add_argument("--b", default="", help="JSON outcomes for condition B (omit for A/A)")
-    p.add_argument("--aa", action="store_true", help="A/A identity smoke check (ignore --b, reuse --a)")
+    p.add_argument("--b", default=None, help="JSON outcomes for condition B (required unless --aa)")
+    p.add_argument("--aa", action="store_true", help="A/A identity smoke check (mutually exclusive with --b)")
     p.add_argument("--alpha", type=float, default=0.05)
     p.add_argument("--boot", type=int, default=10000)
     p.add_argument("--seed", type=int, default=42)
@@ -582,15 +684,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = p.parse_args(list(argv) if argv is not None else None)
 
     try:
-        ids = _manifest_ids(_load_json(args.manifest))
-        a = _outcomes(_load_json(args.a))
-        if args.aa or not args.b:
+        if (args.b is not None) == args.aa:
+            raise EvalkitError("exactly one of --b or --aa is required")
+        ids = _manifest_ids(_load_json(args.manifest, label="--manifest"))
+        a = _outcomes(_load_json(args.a, label="--a"), ids)
+        if args.aa:
             report = compare_aa(
                 ids, a, alpha=args.alpha, n_boot=args.boot,
                 seed=args.seed, allow_graded=args.allow_graded,
             )
         else:
-            b = _outcomes(_load_json(args.b))
+            b = _outcomes(_load_json(args.b, label="--b"), ids)
             report = compare(
                 ids, a, b, alpha=args.alpha, n_boot=args.boot,
                 seed=args.seed, allow_graded=args.allow_graded,
@@ -598,9 +702,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except EvalkitError as exc:
         print(f"ERR_EVALKIT {exc}", file=sys.stderr)
         return 2
-    except OSError as exc:
-        print(f"ERR_EVALKIT {exc}", file=sys.stderr)
-        return 1
 
     if args.json:
         try:
