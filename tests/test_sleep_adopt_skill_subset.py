@@ -33,6 +33,14 @@ def _sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _canonical(path):
+    return os.path.realpath(os.path.abspath(path))
+
+
+def _same_path(left, right):
+    return os.path.normcase(_canonical(left)) == os.path.normcase(_canonical(right))
+
+
 def _read(path):
     with open(path, encoding="utf-8", newline="") as f:
         return f.read()
@@ -54,9 +62,10 @@ class TwoSkillNight:
         alpha_body="# alpha v1\n",
         beta_body="# beta v1\n",
     ):
-        tmp = os.path.realpath(tmp)
         self.tmp = tmp
-        self.live_root = os.path.join(tmp, "live")
+        # Keep the project's lexical spelling so status/latest receipts remain
+        # user-facing, but pin live targets to one canonical filesystem identity.
+        self.live_root = os.path.join(_canonical(tmp), "live")
         self.alpha_live = os.path.join(self.live_root, "alpha", "SKILL.md")
         self.beta_live = os.path.join(self.live_root, "beta", "SKILL.md")
         for path, body in (
@@ -91,13 +100,14 @@ class TestAdoptionIsConfinedToTheStagedRoots(unittest.TestCase):
     """
 
     def _retarget(self, staging, skill_name, new_live):
+        new_live = _canonical(new_live)
         manifest_path = os.path.join(staging, "manifest.json")
         with open(manifest_path, encoding="utf-8") as handle:
             manifest = json.load(handle)
         for row in manifest["skills"]:
             if row["skill_name"] == skill_name:
                 row["live_skill_path"] = new_live
-                row["live_realpath"] = os.path.realpath(new_live)
+                row["live_realpath"] = new_live
                 if row.get("live_sha256"):
                     if os.path.exists(new_live):
                         with open(new_live, "rb") as h:
@@ -341,7 +351,7 @@ class TestAdoptSkillSubset(unittest.TestCase):
             real_write = staging_mod._write_atomic
 
             def boom(path, text, *, create_parents=True):
-                if path == night.beta_live:
+                if _same_path(path, night.beta_live):
                     raise OSError("disk full")
                 return real_write(path, text, create_parents=create_parents)
 
@@ -362,7 +372,7 @@ class TestAdoptSkillSubset(unittest.TestCase):
 
             def commit_then_fail(path, text, *, create_parents=True):
                 result = real_write(path, text, create_parents=create_parents)
-                if path == night.beta_live:
+                if _same_path(path, night.beta_live):
                     raise OSError("late close failure")
                 return result
 
@@ -388,7 +398,7 @@ class TestAdoptSkillSubset(unittest.TestCase):
             real_write = staging_mod._write_atomic
 
             def boom(path, text, *, create_parents=True):
-                if path == night.beta_live:
+                if _same_path(path, night.beta_live):
                     raise OSError("disk full")
                 return real_write(path, text, create_parents=create_parents)
 
@@ -556,7 +566,7 @@ class TestAdoptSkillSubset(unittest.TestCase):
             real_write = staging_mod._write_atomic
 
             def boom(path, text, *, create_parents=True):
-                if path == night.beta_live:
+                if _same_path(path, night.beta_live):
                     raise OSError("disk full")
                 return real_write(path, text, create_parents=create_parents)
 
@@ -579,7 +589,7 @@ class TestAdoptSkillSubset(unittest.TestCase):
             )
 
             def boom(path, data, *, mode=None):
-                if path == beta_backup:
+                if _same_path(path, beta_backup):
                     raise OSError("backup device full")
                 return real_write_new(path, data, mode=mode)
 
@@ -1566,7 +1576,7 @@ class TestAdoptHardeningPinsAndLayout(unittest.TestCase):
             real_write = staging_mod._write_atomic
 
             def pause_first_live_write(path, text, *, create_parents=True):
-                if path == night.alpha_live and not entered.is_set():
+                if _same_path(path, night.alpha_live) and not entered.is_set():
                     entered.set()
                     if not release.wait(5):
                         raise RuntimeError("test timed out waiting for release")
@@ -1598,7 +1608,7 @@ class TestAdoptHardeningPinsAndLayout(unittest.TestCase):
         from skillopt_sleep import staging as staging_mod
 
         with tempfile.TemporaryDirectory() as tmp:
-            live = os.path.join(tmp, "live", "alpha", "SKILL.md")
+            live = os.path.join(_canonical(tmp), "live", "alpha", "SKILL.md")
             _write(live, "# alpha v1\n")
 
             def stage(proposal):
@@ -1621,7 +1631,7 @@ class TestAdoptHardeningPinsAndLayout(unittest.TestCase):
             real_write = staging_mod._write_atomic
 
             def pause_first_live_write(path, text, *, create_parents=True):
-                if path == live and not entered.is_set():
+                if _same_path(path, live) and not entered.is_set():
                     entered.set()
                     if not release.wait(5):
                         raise RuntimeError("test timed out waiting for release")
@@ -1717,8 +1727,9 @@ class TestAdoptHardeningPinsAndLayout(unittest.TestCase):
 
 class TestDurableAdoptionTransaction(unittest.TestCase):
     def _legacy_night(self, tmp):
-        skill = os.path.join(tmp, "live", "skill", "SKILL.md")
-        memory = os.path.join(tmp, "live", "CLAUDE.md")
+        live_root = os.path.join(_canonical(tmp), "live")
+        skill = os.path.join(live_root, "skill", "SKILL.md")
+        memory = os.path.join(live_root, "CLAUDE.md")
         _write(skill, "# skill v1\n")
         _write(memory, "# memory v1\n")
         staging = write_staging(
@@ -1742,7 +1753,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
             real_write_new = staging_mod._write_new_bytes
 
             def observe_backup(path, data, *, mode=None):
-                if path == wal_path:
+                if _same_path(path, wal_path):
                     return real_write_new(path, data, mode=mode)
                 with open(wal_path, encoding="utf-8") as handle:
                     wal = json.load(handle)
@@ -1767,7 +1778,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
 
             def commit_then_fail(path, text, *, create_parents=True):
                 result = real_write(path, text, create_parents=create_parents)
-                if path == night.alpha_live:
+                if _same_path(path, night.alpha_live):
                     raise OSError("simulated process interruption")
                 return result
 
@@ -1803,7 +1814,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
 
             def commit_then_fail(path, text, *, create_parents=True):
                 result = real_write(path, text, create_parents=create_parents)
-                if path == night.alpha_live:
+                if _same_path(path, night.alpha_live):
                     raise OSError("simulated interruption")
                 return result
 
@@ -1832,7 +1843,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
         from skillopt_sleep import staging as staging_mod
 
         with tempfile.TemporaryDirectory() as tmp:
-            live = os.path.join(tmp, "live", "alpha", "SKILL.md")
+            live = os.path.join(_canonical(tmp), "live", "alpha", "SKILL.md")
             _write(live, "# alpha v1\n")
             previous_cwd = os.getcwd()
             try:
@@ -1854,7 +1865,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
 
                 def commit_then_fail(path, text, *, create_parents=True):
                     result = real_write(path, text, create_parents=create_parents)
-                    if path == live:
+                    if _same_path(path, live):
                         raise OSError("simulated interruption")
                     return result
 
@@ -1886,7 +1897,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
 
             def commit_then_fail(path, text, *, create_parents=True):
                 result = real_write(path, text, create_parents=create_parents)
-                if path == night.alpha_live:
+                if _same_path(path, night.alpha_live):
                     raise OSError("simulated interruption")
                 return result
 
@@ -1922,7 +1933,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
             real_write = staging_mod._write_atomic
 
             def fail_beta_after_human_edit(path, text, *, create_parents=True):
-                if path == night.beta_live:
+                if _same_path(path, night.beta_live):
                     _write(night.alpha_live, "# concurrent human edit\n")
                     raise OSError("beta disk failure")
                 return real_write(path, text, create_parents=create_parents)
@@ -1952,7 +1963,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
             real_write = staging_mod._write_atomic
 
             def edit_live_before_receipt(path, text, *, create_parents=True):
-                if path == receipt_path:
+                if _same_path(path, receipt_path):
                     _write(night.alpha_live, "# concurrent human edit\n")
                 return real_write(path, text, create_parents=create_parents)
 
@@ -2065,7 +2076,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
 
     def test_legacy_missing_targets_can_share_one_new_parent(self):
         with tempfile.TemporaryDirectory() as tmp:
-            live_root = os.path.join(tmp, "new-live")
+            live_root = os.path.join(_canonical(tmp), "new-live")
             skill = os.path.join(live_root, "SKILL.md")
             memory = os.path.join(live_root, "CLAUDE.md")
             staging = write_staging(
@@ -2085,7 +2096,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
         from skillopt_sleep import staging as staging_mod
 
         with tempfile.TemporaryDirectory() as tmp:
-            live_root = os.path.join(tmp, "new", "nested", "live")
+            live_root = os.path.join(_canonical(tmp), "new", "nested", "live")
             skill = os.path.join(live_root, "SKILL.md")
             memory = os.path.join(live_root, "CLAUDE.md")
             staging = write_staging(
@@ -2101,7 +2112,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
             real_write = staging_mod._write_atomic
 
             def fail_receipt(path, text, *, create_parents=True):
-                if path == receipt:
+                if _same_path(path, receipt):
                     raise OSError("receipt device full")
                 return real_write(path, text, create_parents=create_parents)
 
@@ -2118,7 +2129,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
         from skillopt_sleep import staging as staging_mod
 
         with tempfile.TemporaryDirectory() as tmp:
-            live_root = os.path.join(tmp, "new-live")
+            live_root = os.path.join(_canonical(tmp), "new-live")
             skill = os.path.join(live_root, "SKILL.md")
             memory = os.path.join(live_root, "CLAUDE.md")
             staging = write_staging(
@@ -2135,7 +2146,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
             real_write = staging_mod._write_atomic
 
             def fail_receipt(path, text, *, create_parents=True):
-                if path == receipt:
+                if _same_path(path, receipt):
                     raise OSError("receipt device full")
                 return real_write(path, text, create_parents=create_parents)
 
@@ -2163,7 +2174,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
         from skillopt_sleep import staging as staging_mod
 
         with tempfile.TemporaryDirectory() as tmp:
-            live_root = os.path.join(tmp, "restart", "live")
+            live_root = os.path.join(_canonical(tmp), "restart", "live")
             skill = os.path.join(live_root, "SKILL.md")
             memory = os.path.join(live_root, "CLAUDE.md")
             staging = write_staging(
@@ -2179,7 +2190,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
             real_write = staging_mod._write_atomic
 
             def fail_receipt(path, text, *, create_parents=True):
-                if path == receipt:
+                if _same_path(path, receipt):
                     raise OSError("simulated interruption")
                 return real_write(path, text, create_parents=create_parents)
 
@@ -2236,7 +2247,7 @@ class TestDurableAdoptionTransaction(unittest.TestCase):
             real_write = staging_mod._write_atomic
 
             def fail_memory(path, text, *, create_parents=True):
-                if path == memory:
+                if _same_path(path, memory):
                     raise OSError("memory disk failure")
                 return real_write(path, text, create_parents=create_parents)
 

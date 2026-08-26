@@ -439,6 +439,7 @@ def _write_atomic_bytes(
     *,
     create_parents: bool = True,
     mode: Optional[int] = None,
+    replace_permission_retries: int = 0,
 ) -> None:
     """Write raw bytes atomically, optionally restoring an exact file mode."""
     directory = os.path.dirname(path) or "."
@@ -458,16 +459,16 @@ def _write_atomic_bytes(
                 else:
                     os.chmod(tmp, existing_mode)
             os.fsync(f.fileno())
-        # Windows can transiently deny a replace when another publisher has
-        # just replaced the same destination and the filesystem has not yet
-        # released its handle. Keep the operation atomic and bounded; never
-        # fall back to unlink-then-rename, which would expose a missing pointer.
-        for attempt in range(20):
+        # A caller may explicitly tolerate a bounded transient Windows sharing
+        # violation. Live files, WALs, receipts, backups, and rollback always
+        # use the zero-retry default so a concurrent editor cannot be overwritten
+        # after the caller's compare-and-swap validation.
+        for attempt in range(replace_permission_retries + 1):
             try:
                 os.replace(tmp, path)
                 break
             except PermissionError:
-                if os.name != "nt" or attempt == 19:
+                if os.name != "nt" or attempt == replace_permission_retries:
                     raise
                 time.sleep(0.005 * (attempt + 1))
         _fsync_parent(path)
@@ -557,6 +558,18 @@ def _remove_private_temp_aliases(path: str) -> None:
             continue
     if removed:
         _fsync_directory(directory)
+        if os.name == "nt":
+            # NTFS can report the pre-unlink link count briefly after the
+            # directory entry is gone. Wait only for metadata convergence;
+            # any surviving hard link still leaves nlink > 1 and the caller
+            # will continue to fail closed.
+            for attempt in range(20):
+                try:
+                    if os.lstat(path).st_nlink <= 1:
+                        break
+                except OSError:
+                    break
+                time.sleep(0.005 * (attempt + 1))
 
 
 def _artifact_snapshot(path: str) -> Optional[tuple[bytes, int]]:
@@ -926,7 +939,14 @@ def _publish_latest(root: str, out: str) -> None:
             or info.st_nlink != 1
         ):
             raise StagingError(f"latest-staging pointer is unsafe: {pointer}")
-    _write_atomic_bytes(pointer, f"{name}\n".encode("utf-8"), mode=0o600)
+    # Concurrent staging publishers may briefly retain the replace destination
+    # on Windows. Retrying is safe only for this derived, last-writer-wins pointer.
+    _write_atomic_bytes(
+        pointer,
+        f"{name}\n".encode("utf-8"),
+        mode=0o600,
+        replace_permission_retries=20,
+    )
 
 
 def _staging_order(path: str) -> tuple:

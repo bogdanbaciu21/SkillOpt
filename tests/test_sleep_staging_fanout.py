@@ -372,6 +372,80 @@ class TestWriteStagingCompatibility(unittest.TestCase):
             ) as handle:
                 self.assertEqual(handle.read().strip(), os.path.basename(latest))
 
+    def test_latest_pointer_retries_a_transient_windows_sharing_violation(self):
+        from skillopt_sleep import staging as staging_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, ".skillopt-sleep", "staging")
+            night = os.path.join(root, "20260815-010203")
+            os.makedirs(night)
+            with open(os.path.join(night, "manifest.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            real_replace = os.replace
+            calls = []
+
+            def transient_replace(source, destination):
+                calls.append((source, destination))
+                if len(calls) == 1:
+                    raise PermissionError("simulated Windows sharing violation")
+                return real_replace(source, destination)
+
+            with mock.patch.object(staging_mod.os, "name", "nt"), mock.patch.object(
+                staging_mod.os, "replace", side_effect=transient_replace
+            ), mock.patch.object(staging_mod.time, "sleep") as sleep:
+                staging_mod._publish_latest(root, night)
+
+            self.assertEqual(len(calls), 2)
+            sleep.assert_called_once_with(0.005)
+            with open(os.path.join(root, ".latest"), encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "20260815-010203\n")
+
+    def test_generic_atomic_write_never_retries_permission_error(self):
+        from skillopt_sleep import staging as staging_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = os.path.join(tmp, "live.md")
+            with open(destination, "wb") as handle:
+                handle.write(b"original")
+            with mock.patch.object(staging_mod.os, "name", "nt"), mock.patch.object(
+                staging_mod.os,
+                "replace",
+                side_effect=PermissionError("live file is busy"),
+            ) as replace, self.assertRaises(PermissionError):
+                staging_mod._write_atomic_bytes(destination, b"proposal")
+
+            replace.assert_called_once()
+            with open(destination, "rb") as handle:
+                self.assertEqual(handle.read(), b"original")
+            self.assertFalse(any(name.startswith(".tmp-") for name in os.listdir(tmp)))
+
+    def test_latest_pointer_persistent_error_preserves_destination_and_cleans_temp(self):
+        from skillopt_sleep import staging as staging_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, ".skillopt-sleep", "staging")
+            night = os.path.join(root, "20260815-010203")
+            os.makedirs(night)
+            with open(os.path.join(night, "manifest.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            pointer = os.path.join(root, ".latest")
+            with open(pointer, "w", encoding="utf-8") as handle:
+                handle.write("20260814-010203\n")
+
+            with mock.patch.object(staging_mod.os, "name", "nt"), mock.patch.object(
+                staging_mod.os,
+                "replace",
+                side_effect=PermissionError("pointer remains busy"),
+            ) as replace, mock.patch.object(staging_mod.time, "sleep"), self.assertRaises(
+                PermissionError
+            ):
+                staging_mod._publish_latest(root, night)
+
+            self.assertEqual(replace.call_count, 21)
+            with open(pointer, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "20260814-010203\n")
+            self.assertFalse(any(name.startswith(".tmp-") for name in os.listdir(root)))
+
     def test_latest_ignores_a_symlinked_night(self):
         with tempfile.TemporaryDirectory() as tmp:
             real_night = write_staging(
