@@ -1933,27 +1933,32 @@ def _existing_path_is_canonical_staging_descendant(
     The staging root itself may be supplied through a symlink, so compare the
     resolved candidate with the same relative path beneath the resolved root.
     """
-    candidate_abs = os.path.abspath(path)
-    root_abs = os.path.abspath(staging_dir)
-    root_real = os.path.realpath(root_abs)
-    # A caller may hold a lexical spelling of the staging root while WAL paths
-    # carry its canonical spelling (/var vs /private/var on macOS, or a Windows
-    # short name vs long name). Derive the relative path from either root
-    # spelling, then still require the candidate's resolved path to equal that
-    # exact location under the resolved root. A symlinked descendant therefore
-    # remains a refusal rather than being blessed by realpath containment.
-    for root_spelling in (root_abs, root_real):
+    candidate = os.path.abspath(path)
+    root = os.path.abspath(staging_dir)
+    # Compare actual directory identities while walking upward. This tolerates
+    # equivalent root spellings (/var vs /private/var and Windows 8.3 vs long
+    # names) without resolving away a symlink/junction *below* the root. The
+    # supplied root itself may be an alias, so test its identity before applying
+    # the descendant-link refusal.
+    current = candidate
+    while True:
         try:
-            relative = os.path.relpath(candidate_abs, root_spelling)
-        except ValueError:
-            continue
-        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
-            continue
-        expected_real = os.path.join(root_real, relative)
-        return _path_identity_key(os.path.realpath(candidate_abs)) == (
-            _path_identity_key(expected_real)
-        )
-    return False
+            if os.path.samefile(current, root):
+                if (
+                    _path_identity_key(current) != _path_identity_key(root)
+                    and _path_is_within(current, root)
+                    and _is_link_or_junction(current)
+                ):
+                    return False
+                return current != candidate
+        except OSError:
+            return False
+        if _is_link_or_junction(current):
+            return False
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
 
 
 def _immutable_backup_snapshot(

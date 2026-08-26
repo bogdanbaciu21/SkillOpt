@@ -465,9 +465,12 @@ class TestWriteStagingCompatibility(unittest.TestCase):
             except OSError:
                 self.skipTest("directory symlinks unavailable")
 
-            ordinary = os.path.join(real_root, "backup.md")
-            with open(ordinary, "w", encoding="utf-8") as handle:
+            ordinary_lexical = os.path.join(real_root, "backup.md")
+            with open(ordinary_lexical, "w", encoding="utf-8") as handle:
                 handle.write("backup")
+            # WAL/manifest paths are canonical, while callers can still supply
+            # the same staging root through a lexical alias.
+            ordinary = os.path.realpath(ordinary_lexical)
             escaped = os.path.join(alias_root, "child-alias", "outside.md")
             with open(os.path.join(outside, "outside.md"), "w", encoding="utf-8") as handle:
                 handle.write("outside")
