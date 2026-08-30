@@ -308,7 +308,8 @@ This runs one additional consolidation per group (including a catch-all group wh
 hinted and unhinted evidence are mixed), so it multiplies backend calls and token
 use; configured dream rollouts and synthetic variants multiply the per-group work
 too. Each group inherits the configured edit budget, gate mode/metric,
-`gate_no_regression`, `dream_rollouts`, `dream_factor`, `recall_k`, and
+`gate_no_regression`, `dream_rollouts`, `dream_factor`, `dream_adversarial`,
+`dream_adversarial_blocking`, `dream_adversarial_margin`, `recall_k`, and
 `evolve_skill`. Recalled archive tasks are restricted to that same skill hint;
 shared memory is read-only in fan-out runs. Setting `evolve_skill` to `false`
 therefore disables per-skill proposals as well as the managed skill proposal.
@@ -327,17 +328,43 @@ Resolution searches existing project-native `.agents/skills`, `.claude/skills`,
 home and plugin-cache roots. Add repeatable `--skill-root PATH` values when an
 integration stores skills elsewhere. Relative roots resolve below `--project`.
 
-### Opt-in: experience replay & dream rollouts
+### Opt-in: experience replay, dream rollouts, and robustness probes
 
-Two consolidation mechanisms, both default **off** (behavior is unchanged unless you
-enable them). They strengthen the nightly update when your tasks have a clean
-correctness signal; the validation gate still governs what ships.
+These controls are default **off** (behavior is unchanged unless you enable
+them). Replay and rollouts strengthen the training signal; adversarial probes
+measure candidate robustness. The validation gate still governs what ships
+unless explicit adversarial blocking adds a second rejection condition.
 
 | Config knob | Default | Effect |
 |---|---|---|
 | `dream_rollouts` | `1` | Run each task K times → learn from the good-vs-bad contrast (contrastive reflection). |
 | `recall_k` | `0` | Associative recall — pull the K most-similar past tasks (from a persisted archive) into tonight's dream. |
 | `dream_factor` | `0` | Add N lightweight synthetic variants of each task. |
+| `dream_adversarial` | `0` | Score up to N harmless request-frame variants per real training task against each gate-eligible candidate. The factor is capped at 3 per task and 256 probes per candidate. |
+| `dream_adversarial_blocking` | `false` | When `true`, reject a candidate if any probe drops beyond the configured margin. When `false`, surface the same evidence without changing the gate decision. |
+| `dream_adversarial_margin` | `0.0` | Tolerated source-to-probe score drop in `[0, 1]` before a row is marked brittle. |
+
+Adversarial probes preserve the source reference and judge but change only the
+request frame (for example, removing polite boilerplate or adding explicit
+request delimiters). They are generated from real, underived training tasks
+only. Recalled, already-synthetic, validation, and test tasks are excluded.
+The report records every source/probe score and the exact perturbation that
+failed. Probes are advisory first because any fixed robustness suite is an
+incomplete proxy; enable blocking only after reviewing its behavior on your
+task mix. Blocking mode fails closed if no eligible probe can be generated.
+Each candidate adds one source rollout per eligible task plus N probe rollouts,
+so token and latency cost grow with the number of real training tasks and the
+selected factor.
+
+Example `~/.skillopt-sleep/config.json`:
+
+```json
+{
+  "dream_adversarial": 2,
+  "dream_adversarial_blocking": false,
+  "dream_adversarial_margin": 0.015
+}
+```
 
 ### Paired A/B evalkit
 
