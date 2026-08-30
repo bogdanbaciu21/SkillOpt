@@ -70,6 +70,7 @@ DEFAULTS: Dict[str, Any] = {
     # ── dream + recall (opt-in; defaults reproduce the prior single-shot loop) ─
     "dream_rollouts": 1,          # >1 => multi-rollout contrastive reflection per task
     "dream_factor": 0,            # >0 => add N synthetic variants of each task to the dream
+    "llm_dream": False,           # opt-in paraphrase generator; templates stay the default
     "recall_k": 0,                # >0 => recall the K most-similar past tasks into the dream
     "evolve_memory": True,        # consolidate CLAUDE.md
     "evolve_skill": True,         # consolidate the managed SKILL.md
@@ -227,6 +228,10 @@ def load_config(**overrides: Any) -> SleepConfig:
         if value is not None:
             data[key] = value
             user_keys.add(key)
+    # This opt-in can spend provider tokens. Accept the JSON/YAML boolean only;
+    # values such as the string "false" are truthy in Python and must never
+    # accidentally enable generation.
+    data["llm_dream"] = data.get("llm_dream") is True
     if data.get("projects") == "invoked" and not data.get("invoked_project"):
         data["invoked_project"] = os.getcwd()
     data["_user_config_keys"] = sorted(user_keys)

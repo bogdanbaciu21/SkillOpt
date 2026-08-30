@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from skillopt_sleep.types import EditRecord, ReplayResult, TaskRecord
 
@@ -58,6 +58,10 @@ class Backend:
 
     def attempt(self, task: TaskRecord, skill: str, memory: str,
                 sample_id: int = 0) -> str:
+        raise NotImplementedError
+
+    def generate(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        """Run optimizer-side text generation, never target task execution."""
         raise NotImplementedError
 
     def attempt_with_tools(
@@ -324,6 +328,11 @@ class CliBackend(Backend):
     """
 
     name = "cli"
+    # Subclasses must opt in only after their ordinary call path has a verified
+    # no-tools boundary. Dream prompts contain harvested task text, so routing
+    # them through a coding-agent shell merely because it can return text would
+    # turn paraphrasing into an unintended local execution surface.
+    generation_tools_disabled = False
 
     def __init__(self, model: str = "", timeout: int = 180) -> None:
         self.model = model
@@ -337,27 +346,62 @@ class CliBackend(Backend):
     def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
         raise NotImplementedError
 
-    def _cached_call(self, key: str, prompt: str, *, max_tokens: int = 1024) -> str:
+    def _cached_call(
+        self,
+        key: str,
+        prompt: str,
+        *,
+        max_tokens: int = 1024,
+        call_fn: Optional[Callable[..., str]] = None,
+    ) -> str:
         kind = key.split(":", 1)[0]
         ev = getattr(self, "evidence", None)
+        event_stage = "dream" if kind == "generate" else "replay"
+        event_phase = (
+            "dream" if kind == "generate" else getattr(self, "evidence_phase", "")
+        )
         if key in self._cache:
             # cache hits log key-only (the full text is on the original miss event)
             if ev is not None:
-                ev.log("replay", "model_call", kind=kind, cache_hit=True, key=key,
-                       phase=getattr(self, "evidence_phase", ""), backend=self.name,
+                ev.log(event_stage, "model_call", kind=kind, cache_hit=True, key=key,
+                       phase=event_phase, backend=self.name,
                        model=self.model)
             return self._cache[key]
-        out = self._call(prompt, max_tokens=max_tokens)
+        out = (call_fn or self._call)(prompt, max_tokens=max_tokens)
         self._tokens += len(prompt) // 4 + len(out) // 4
         self._cache[key] = out
         if ev is not None:
-            ev.log("replay", "model_call", kind=kind, cache_hit=False, key=key,
-                   phase=getattr(self, "evidence_phase", ""), backend=self.name,
+            ev.log(event_stage, "model_call", kind=kind, cache_hit=False, key=key,
+                   phase=event_phase, backend=self.name,
                    model=self.model, prompt=prompt, response=out,
                    error=getattr(self, "last_call_error", "") or "")
         return out
 
     # operations -----------------------------------------------------------
+    def _generation_boundary_verified(self) -> bool:
+        """Return whether this instance's ordinary call path disables tools."""
+        return self.generation_tools_disabled
+
+    def _generation_call(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        """Call through the backend's verified generation-only boundary."""
+        return self._call(prompt, max_tokens=max_tokens)
+
+    def generate(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        """Generate optimizer material through the backend's native call path."""
+        if not self._generation_boundary_verified():
+            self.last_call_error = (
+                f"{self.name} optimizer generation is disabled because its "
+                "no-tools boundary has not been verified"
+            )
+            raise RuntimeError(self.last_call_error)
+        key = "generate:" + skill_hash(prompt)
+        return self._cached_call(
+            key,
+            prompt,
+            max_tokens=max_tokens,
+            call_fn=self._generation_call,
+        )
+
     def attempt(self, task: TaskRecord, skill: str, memory: str,
                 sample_id: int = 0) -> str:
         # sample_id distinguishes repeated rollouts of the SAME (task, skill,
@@ -572,6 +616,7 @@ class PiCliBackend(CliBackend):
     """
 
     name = "pi"
+    generation_tools_disabled = True
 
     def __init__(self, model: str = "", pi_path: str = "pi", timeout: int = 180) -> None:
         super().__init__(model=model or os.environ.get("SKILLOPT_SLEEP_PI_MODEL", ""),
@@ -602,13 +647,22 @@ class PiCliBackend(CliBackend):
             "Pi CLI call failed: %s", self.last_call_error
         )
 
-    def _cached_call(self, key: str, prompt: str, *, max_tokens: int = 1024) -> str:
+    def _cached_call(
+        self,
+        key: str,
+        prompt: str,
+        *,
+        max_tokens: int = 1024,
+        call_fn: Optional[Callable[..., str]] = None,
+    ) -> str:
         """Do not make a transient Pi failure sticky in the response cache."""
         if key in self._cache:
             # A cached success must not expose an unrelated previous failure
             # through diagnostics/evidence attached to this call.
             self.last_call_error = ""
-        out = super()._cached_call(key, prompt, max_tokens=max_tokens)
+        out = super()._cached_call(
+            key, prompt, max_tokens=max_tokens, call_fn=call_fn
+        )
         if not out:
             self._cache.pop(key, None)
         return out
@@ -703,6 +757,10 @@ class ClaudeCliBackend(CliBackend):
     """Drives the authenticated `claude` CLI: claude -p --output-format text."""
 
     name = "claude"
+    # Claude's `--bare` mode disables hooks/plugins as well as tools, but it is
+    # compatible only with API-key auth.  Subscription auth therefore cannot
+    # meet the stronger boundary required for harvested dream inputs.
+    generation_tools_disabled = False
 
     def __init__(self, model: str = "", claude_path: str = "claude", timeout: int = 180) -> None:
         super().__init__(model=model or os.environ.get("SKILLOPT_SLEEP_CLAUDE_MODEL", "") or "sonnet",
@@ -747,7 +805,33 @@ class ClaudeCliBackend(CliBackend):
                 self.last_call_error = combined[:500]
                 return
 
+    def _generation_boundary_verified(self) -> bool:
+        return bool(os.environ.get("ANTHROPIC_API_KEY"))
+
     def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        return self._call_claude(
+            prompt,
+            max_tokens=max_tokens,
+            bare=bool(os.environ.get("ANTHROPIC_API_KEY")),
+        )
+
+    def _generation_call(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        # Revalidate at the call boundary. Once admitted, generation always
+        # builds a --bare command; an environment change can make auth fail but
+        # can never silently fall back to hooks/plugins.
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError(
+                "claude optimizer generation requires API-key auth for --bare"
+            )
+        return self._call_claude(prompt, max_tokens=max_tokens, bare=True)
+
+    def _call_claude(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 1024,
+        bare: bool,
+    ) -> str:
         # Run ISOLATED so the ambient Claude Code environment does not leak into
         # the optimizer/target call. Critically, the user's GLOBAL skills
         # (~/.claude/skills) are injected regardless of cwd, so we must disable
@@ -762,7 +846,7 @@ class ClaudeCliBackend(CliBackend):
         #   cwd=<clean temp>          no project CLAUDE.md
         import tempfile
         cmd = [self.claude_path, "-p", "--output-format", "text"]
-        if os.environ.get("ANTHROPIC_API_KEY"):
+        if bare:
             cmd.append("--bare")
         cmd += [
             "--disable-slash-commands",
@@ -1074,6 +1158,7 @@ class OpenCodeCliBackend(CliBackend):
     """Run SkillOpt model calls through the user's OpenCode CLI."""
 
     name = "opencode"
+    generation_tools_disabled = True
 
     def __init__(
         self,
@@ -1237,11 +1322,20 @@ class OpenCodeCliBackend(CliBackend):
         if {name for name, enabled in tools.items() if enabled} != expected:
             raise OpenCodeError("OpenCode CLI could not restrict tools to the replay allowlist")
 
-    def _cached_call(self, key: str, prompt: str, *, max_tokens: int = 1024) -> str:
+    def _cached_call(
+        self,
+        key: str,
+        prompt: str,
+        *,
+        max_tokens: int = 1024,
+        call_fn: Optional[Callable[..., str]] = None,
+    ) -> str:
         """Keep failed OpenCode calls out of the cache."""
         if key in self._cache:
             self.last_call_error = ""
-        out = super()._cached_call(key, prompt, max_tokens=max_tokens)
+        out = super()._cached_call(
+            key, prompt, max_tokens=max_tokens, call_fn=call_fn
+        )
         if not out:
             self._cache.pop(key, None)
         return out
@@ -1263,6 +1357,7 @@ class OpenCodeCliBackend(CliBackend):
                 env = self._build_child_environment(work, permission)
                 env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
                 self._disable_and_verify_mcp(env, work, config)
+                self._verify_tool_allowlist(env, work, agent, set())
                 proc = self._run_process(
                     self._build_run_command(work, agent, "skillopt-sleep"),
                     env,
@@ -2155,6 +2250,7 @@ class DualBackend(Backend):
     """Route operations to two backends, à la SkillOpt's target vs optimizer.
 
       * attempt  -> TARGET backend (the model the skill is deployed on)
+      * generate -> OPTIMIZER backend (synthetic/optimizer-side material)
       * reflect  -> OPTIMIZER backend (the stronger/cheaper model writing edits)
       * judge    -> OPTIMIZER backend (graded by the optimizer when no local rule)
 
@@ -2172,6 +2268,9 @@ class DualBackend(Backend):
 
     def attempt(self, task, skill, memory, sample_id: int = 0):
         return self.target.attempt(task, skill, memory, sample_id=sample_id)
+
+    def generate(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        return self.optimizer.generate(prompt, max_tokens=max_tokens)
 
     def attempt_with_tools(self, task, skill, memory, tools):
         return self.target.attempt_with_tools(task, skill, memory, tools)
@@ -2229,6 +2328,7 @@ class AzureOpenAIBackend(CliBackend):
     """
 
     name = "azure"
+    generation_tools_disabled = True
 
     _COMPAT_MODES = {"openai_compatible", "compat", "openai"}
     # Hosts the managed-identity (AAD bearer token) path may talk to. A custom

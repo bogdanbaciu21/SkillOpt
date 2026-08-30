@@ -327,3 +327,117 @@ def test_real_opencode_cycle_smoke(monkeypatch, tmp_path):
         pytest.fail("the live cycle report did not record its seeded replay", pytrace=False)
     if outcome.adopted or outcome.adopted_paths:
         pytest.fail("the live cycle did not preserve review-before-adopt behavior", pytrace=False)
+
+
+def test_real_opencode_optimizer_dream_cycle(monkeypatch, tmp_path):
+    """Exercise opt-in dreams through a factory-built dual backend and full cycle."""
+    model, opencode_path = _live_settings()
+    project = tmp_path / "dream-project"
+    project.mkdir()
+    mcp_marker, mcp_name = _add_mcp_canary(monkeypatch, tmp_path)
+    _require_mcp_canary_configured(opencode_path, mcp_name, tmp_path)
+    monkeypatch.setenv("SKILLOPT_SLEEP_WORKERS", "1")
+    monkeypatch.setenv(
+        "SKILLOPT_SLEEP_PROMPTS_PATH",
+        str(tmp_path / "no-prompt-overrides.json"),
+    )
+
+    cfg = SleepConfig(data={
+        **DEFAULTS,
+        "backend": "mock",
+        "target_backend": "mock",
+        "optimizer_backend": "opencode",
+        "optimizer_model": model,
+        "opencode_path": opencode_path,
+        "projects": "invoked",
+        "invoked_project": str(project),
+        "state_dir": str(tmp_path / "dream-state"),
+        "claude_home": str(tmp_path / "dream-claude-home"),
+        "gate_mode": "on",
+        # Real evolution stays ON so the optimizer's reflect/gate path is
+        # exercised end to end; the paired functional receipt lives in
+        # tests/test_llm_dream_live.py.
+        "evolve_skill": True,
+        "evolve_memory": False,
+        "llm_mine": False,
+        "dream_rollouts": 1,
+        "dream_factor": 2,
+        "llm_dream": True,
+        "recall_k": 0,
+        "multi_skill_report": False,
+        "auto_adopt": False,
+        "evidence_log": True,
+        "redact_secrets": True,
+        "progress": False,
+    })
+    train = TaskRecord(
+        id="opencode-live-dream-train",
+        project=str(project),
+        intent="Return the word ready inside answer tags.",
+        reference_kind="exact",
+        reference="ready",
+        tags=["rule:wrap-answer"],
+        split="train",
+    )
+    held_out = TaskRecord(
+        id="opencode-live-dream-val",
+        project=str(project),
+        intent="Return the word checked inside answer tags.",
+        reference_kind="exact",
+        reference="checked",
+        tags=["rule:wrap-answer"],
+        split="val",
+    )
+
+    outcome = run_sleep_cycle(cfg, seed_tasks=[train, held_out])
+    evidence_path = Path(outcome.staging_dir) / "evidence.jsonl"
+    events = read_events(str(evidence_path))
+    summaries = [
+        event for event in events
+        if event.get("stage") == "dream"
+        and event.get("event") == "llm_dream_summary"
+    ]
+    generation_calls = [
+        event for event in events
+        if event.get("stage") == "dream"
+        and event.get("event") == "model_call"
+        and event.get("kind") == "generate"
+    ]
+    target_results = [
+        event for event in events
+        if event.get("stage") == "replay" and event.get("event") == "result"
+    ]
+
+    if mcp_marker.exists():
+        pytest.fail("optimizer dream generation started a configured MCP server", pytrace=False)
+    if not evidence_path.is_file() or not (Path(outcome.staging_dir) / "report.json").is_file():
+        pytest.fail("optimizer dream cycle did not persist evidence and report", pytrace=False)
+    if len(summaries) != 1 or summaries[0].get("n_requested") != 2:
+        pytest.fail("optimizer dream cycle did not record its acceptance summary", pytrace=False)
+    accepted = summaries[0].get("n_accepted")
+    fallback = summaries[0].get("n_fallback")
+    if (
+        not isinstance(accepted, int)
+        or not isinstance(fallback, int)
+        or accepted + fallback != 2
+        or accepted < 1
+    ):
+        pytest.fail("optimizer dream acceptance/fallback accounting is inconsistent", pytrace=False)
+    if summaries[0].get("optimizer_token_delta", 0) <= 0:
+        pytest.fail("optimizer dream cycle did not record generation cost", pytrace=False)
+    if not generation_calls or any(event.get("backend") != "opencode" for event in generation_calls):
+        pytest.fail("dream generation did not stay on the OpenCode optimizer", pytrace=False)
+    if not target_results:
+        pytest.fail("optimizer dream cycle did not execute target replay", pytrace=False)
+    if outcome.report.holdout_leaked:
+        pytest.fail("optimizer dream cycle leaked held-out data", pytrace=False)
+    if outcome.report.candidate_score < outcome.report.baseline_score:
+        pytest.fail("optimizer dream cycle regressed its held-out score", pytrace=False)
+    if outcome.adopted or outcome.adopted_paths:
+        pytest.fail("optimizer dream cycle bypassed review-before-adopt", pytrace=False)
+    reflect_events = [
+        event for event in events
+        if event.get("stage") == "reflect" and event.get("event") == "edits_returned"
+    ]
+    if not reflect_events:
+        pytest.fail("optimizer dream cycle never exercised skill evolution", pytrace=False)

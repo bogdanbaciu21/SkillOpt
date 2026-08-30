@@ -106,6 +106,7 @@ def _successful_plain_results(*mcp_names: str, answer: str = "answer") -> list[_
     return [
         _FakeProc(_resolved_mcp(*mcp_names, snapshot=False)),
         _FakeProc(_resolved_mcp(*mcp_names, disabled=True, snapshot=False)),
+        _FakeProc(json.dumps({"tools": {"bash": False, "edit": False}})),
         _FakeProc(_success_stream(answer)),
     ]
 
@@ -388,7 +389,8 @@ def test_call_uses_stdin_temp_workspace_and_user_environment(monkeypatch, tmp_pa
 
     discovery_cmd, discovery_call = captured[0]
     verification_cmd, verification_call = captured[1]
-    cmd, run_call = captured[2]
+    tool_cmd, tool_call = captured[2]
+    cmd, run_call = captured[3]
     expected_child_env = {
         "NO_COLOR": "1",
         "OPENCODE_DISABLE_AUTOUPDATE": "1",
@@ -413,6 +415,7 @@ def test_call_uses_stdin_temp_workspace_and_user_environment(monkeypatch, tmp_pa
             assert call["env"][key] == value
     assert discovery_cmd == [executable, "debug", "config", "--pure"]
     assert verification_cmd == discovery_cmd
+    assert tool_cmd == [executable, "debug", "agent", cmd[cmd.index("--agent") + 1], "--pure"]
     assert cmd[:5] == [
         executable,
         "run",
@@ -428,6 +431,7 @@ def test_call_uses_stdin_temp_workspace_and_user_environment(monkeypatch, tmp_pa
     assert run_call["input"] == "do the thing"
     assert "input" not in discovery_call
     assert "input" not in verification_call
+    assert "input" not in tool_call
     assert "do the thing" not in cmd
     assert run_call["env"]["OPENAI_API_KEY"] == "ambient-provider-key"
     assert run_call["env"]["HOME"] == "/home/example"
@@ -516,7 +520,7 @@ def test_each_call_uses_a_new_agent_name():
 )
 def test_call_records_process_and_protocol_failures(run_result, error_fragment):
     be = OpenCodeCliBackend(opencode_path="opencode", timeout=1)
-    effects = _successful_plain_results()[:2] + [run_result]
+    effects = _successful_plain_results()[:3] + [run_result]
     with mock.patch("skillopt_sleep.backend.subprocess.run", side_effect=effects):
         assert be._call("hello") == ""
     assert error_fragment in be.last_call_error
@@ -686,11 +690,27 @@ def test_mcp_checks_run_once_per_cache_miss():
     assert commands == [
         ["debug", "config"],
         ["debug", "config"],
+        ["debug", "agent"],
         ["run", "--pure"],
         ["debug", "config"],
         ["debug", "config"],
+        ["debug", "agent"],
         ["run", "--pure"],
     ]
+
+
+def test_plain_generation_fails_before_model_if_any_tool_remains_enabled():
+    be = OpenCodeCliBackend(opencode_path="opencode")
+    results = [
+        _FakeProc(_resolved_mcp(snapshot=False)),
+        _FakeProc(_resolved_mcp(snapshot=False)),
+        _FakeProc(json.dumps({"tools": {"bash": True, "edit": False}})),
+    ]
+    with mock.patch("skillopt_sleep.backend.subprocess.run", side_effect=results) as run:
+        assert be.generate("optimizer prompt") == ""
+    assert run.call_count == 3
+    assert all(call.args[0][1] == "debug" for call in run.call_args_list)
+    assert "restrict tools" in be.last_call_error
 
 
 def test_failed_call_is_not_cached():
@@ -699,6 +719,13 @@ def test_failed_call_is_not_cached():
         assert be._cached_call("attempt:key", "prompt") == ""
         assert be._cached_call("attempt:key", "prompt") == "recovered"
     assert call.call_count == 2
+
+
+def test_generate_routes_through_verified_opencode_generation_call():
+    be = OpenCodeCliBackend()
+    with mock.patch.object(be, "_generation_call", return_value="paraphrase") as call:
+        assert be.generate("optimizer prompt", max_tokens=321) == "paraphrase"
+    call.assert_called_once_with("optimizer prompt", max_tokens=321)
 
 
 def test_cached_success_clears_stale_call_error():

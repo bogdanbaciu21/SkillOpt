@@ -22,12 +22,11 @@ from typing import List, Optional, Sequence
 from skillopt_sleep import evidence
 from skillopt_sleep.backend import Backend, CursorBackendError, build_backend
 from skillopt_sleep.config import DEFAULTS, SleepConfig, load_config
-from skillopt_sleep.dream import dream_consolidate
+from skillopt_sleep.dream import backend_fidelity_fn, backend_generate_fn, dream_consolidate
 from skillopt_sleep.evidence import EvidenceLog
 from skillopt_sleep.harvest_sources import harvest_for_config
 from skillopt_sleep.memory import ensure_skill_scaffold
 from skillopt_sleep.mine import group_tasks_by_skill_hint, mine
-from skillopt_sleep.replay import aggregate_scores, replay_batch
 from skillopt_sleep.multi_skill import (
     SKIPPED,
     GroupConsolidation,
@@ -36,6 +35,7 @@ from skillopt_sleep.multi_skill import (
     consolidate_groups,
     skill_group_reports,
 )
+from skillopt_sleep.replay import aggregate_scores, replay_batch
 from skillopt_sleep.skill_resolver import resolve_skill, skill_search_roots
 from skillopt_sleep.staging import (
     SkillProposal,
@@ -695,7 +695,7 @@ def run_sleep_cycle(
             "target_backend", "target_model", "gate_mode", "gate_metric",
             "gate_mixed_weight", "gate_no_regression", "edit_budget",
             "holdout_fraction", "val_fraction", "test_fraction",
-            "dream_rollouts", "dream_factor", "recall_k",
+            "dream_rollouts", "dream_factor", "llm_dream", "recall_k",
             "max_tasks_per_night", "lookback_hours", "llm_mine",
             "evolve_skill", "evolve_memory")}
         cycle_config["opencode_tool_replay"] = (
@@ -849,6 +849,9 @@ def run_sleep_cycle(
     # consolidate — behavior is unchanged unless the user opts in.
     _progress(cfg, "consolidate start")
     recall_k = int(cfg.get("recall_k", 0) or 0)
+    # `llm_dream` is a spend-bearing opt-in.  Keep this strict even when a
+    # caller constructs/mutates SleepConfig directly instead of load_config().
+    llm_dream_enabled = cfg.get("llm_dream", False) is True
     history_tasks = []
     if recall_k > 0:
         history_tasks = [TaskRecord.from_dict(d) for d in state.task_archive()]
@@ -859,6 +862,14 @@ def run_sleep_cycle(
             recall_k=recall_k,
             dream_rollouts=int(cfg.get("dream_rollouts", 1) or 1),
             dream_factor=int(cfg.get("dream_factor", 0) or 0),
+            llm_dream=llm_dream_enabled,
+            generate_fn=(
+                backend_generate_fn(backend) if llm_dream_enabled else None
+            ),
+            fidelity_fn=(
+                backend_fidelity_fn(backend) if llm_dream_enabled else None
+            ),
+            evidence=ev,
             edit_budget=cfg.get("edit_budget", 4),
             gate_metric=cfg.get("gate_metric", "mixed"),
             gate_mixed_weight=cfg.get("gate_mixed_weight", 0.5),
@@ -953,6 +964,14 @@ def run_sleep_cycle(
                     recall_k=recall_k,
                     dream_rollouts=int(cfg.get("dream_rollouts", 1) or 1),
                     dream_factor=int(cfg.get("dream_factor", 0) or 0),
+                    llm_dream=llm_dream_enabled,
+                    generate_fn=(
+                        backend_generate_fn(backend) if llm_dream_enabled else None
+                    ),
+                    fidelity_fn=(
+                        backend_fidelity_fn(backend) if llm_dream_enabled else None
+                    ),
+                    evidence=ev,
                     edit_budget=cfg.get("edit_budget", 4),
                     gate_metric=cfg.get("gate_metric", "mixed"),
                     gate_mixed_weight=cfg.get("gate_mixed_weight", 0.5),

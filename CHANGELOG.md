@@ -12,6 +12,12 @@ All notable changes to SkillOpt are documented here. This project adheres to
   task-cluster multi-seed inference and seeded null calibration for exact-test
   type-I error and bootstrap coverage. The nightly gate is unchanged
   (thanks @bogdanbaciu21).
+- **SkillOpt-Sleep opt-in `llm_dream`**: paraphrase-only dream variants from
+  the optimizer model, with task-aware semantic verification and deterministic
+  template fallback on parse or fidelity failure. Generation and verification
+  stay on the optimizer side of dual backends; target replay is untouched.
+  Default template dreams stay byte-identical and generated variants remain
+  train-only (thanks @bogdanbaciu21).
 - **SkillOpt-Sleep multi-skill fan-out and reviewed subset adoption**: each
   hinted skill is consolidated from its own pinned live baseline, staged as an
   independent proposal with per-skill gate evidence, and promoted only through

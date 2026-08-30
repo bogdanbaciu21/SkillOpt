@@ -2,11 +2,15 @@
 
 Run: python3 -m pytest tests/test_plugin_sync.py -v
 """
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import unittest
+from unittest import mock
+
+from skillopt_sleep.types import TaskRecord
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -33,6 +37,7 @@ CURSOR_INSTALL_SH = os.path.join(REPO, "plugins/cursor/install.sh")
 CURSOR_INSTALL_PS1 = os.path.join(REPO, "plugins/cursor/install.ps1")
 CURSOR_LICENSE = os.path.join(REPO, "plugins/cursor/LICENSE")
 OPENCLAW_RUNNER = os.path.join(REPO, "plugins/openclaw/run_sleep.py")
+OPENCLAW_BACKEND = os.path.join(REPO, "plugins/openclaw/skillopt_sleep_openclaw.py")
 
 
 def _read(path):
@@ -43,6 +48,43 @@ def _read(path):
 
 
 class TestPluginParity(unittest.TestCase):
+    def test_openclaw_backend_implements_generation_and_sample_id_contract(self):
+        spec = importlib.util.spec_from_file_location(
+            "skillopt_sleep_openclaw_contract_test",
+            OPENCLAW_BACKEND,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        backend = module.OpenClawDeepSeekBackend(model="optimizer-model")
+        prompt = "optimizer-only paraphrase request"
+
+        with mock.patch.object(
+            module,
+            "_chat",
+            side_effect=["generated text", "target answer"],
+        ) as chat:
+            self.assertEqual(
+                backend.generate(prompt, max_tokens=321),
+                "generated text",
+            )
+            generation_tokens = len(prompt) // 4 + len("generated text") // 4
+            self.assertEqual(backend.tokens_used(), generation_tokens)
+            task = TaskRecord(id="openclaw", project="/tmp", intent="answer")
+            self.assertEqual(
+                backend.attempt(task, "skill", "memory", sample_id=7),
+                "target answer",
+            )
+
+        self.assertEqual(chat.call_args_list[0].kwargs["model"], "optimizer-model")
+        self.assertEqual(chat.call_args_list[0].kwargs["max_tokens"], 321)
+        self.assertEqual(chat.call_args_list[0].args[0], [{
+            "role": "user",
+            "content": prompt,
+        }])
+        self.assertGreater(backend.tokens_used(), generation_tokens)
+
     def test_cursor_plugin_manifest_and_marketplace_registration(self):
         with open(CURSOR_MANIFEST, encoding="utf-8") as f:
             manifest = json.load(f)

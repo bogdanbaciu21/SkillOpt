@@ -338,6 +338,59 @@ correctness signal; the validation gate still governs what ships.
 | `dream_rollouts` | `1` | Run each task K times → learn from the good-vs-bad contrast (contrastive reflection). |
 | `recall_k` | `0` | Associative recall — pull the K most-similar past tasks (from a persisted archive) into tonight's dream. |
 | `dream_factor` | `0` | Add N lightweight synthetic variants of each task. |
+| `llm_dream` | `false` | Opt-in optimizer-side paraphrase generator and task-aware semantic verifier. Templates stay the default and are used on any generation, parse, deterministic, or semantic-fidelity failure. v1 is paraphrase-only: parent `reference`/`judge` are copied unchanged, generated tasks stay train-only, and target replay is untouched. |
+
+`llm_dream` accepts only the JSON/YAML boolean `true`; string and numeric values
+fail closed to `false`. Coding-agent optimizers may generate dreams only when
+their ordinary call path has a verified no-tools boundary. Pi disables tools
+and ambient extensions; OpenCode resolves its agent configuration and refuses
+generation unless the enabled-tool set is empty. Claude generation additionally
+requires API-key authentication so `--bare` can disable hooks and plugins;
+Claude subscription authentication therefore falls back to templates. Provider
+API backends do not expose local tools. Codex, Copilot, Cursor, handoff, and any
+other unverified coding-agent path also fail closed to deterministic template
+dreams instead of exposing harvested task text to an agent tool loop.
+
+The deterministic replay fixture in `tests/test_llm_dream.py` drives the full
+cycle through config resolution, optimizer-only generation, validation gating,
+evidence logging, and staging. It exercises one accepted and one rejected
+candidate (50% acceptance / 50% fallback), accounts optimizer generation usage
+while confirming zero target-generation calls, and records an exact held-out
+improvement from `0.0` to `1.0`, matching the template control. It is
+deterministic CI evidence, not a claim about any live provider's semantic
+quality or pricing.
+
+Functional benefit is pinned by two paired dream-off versus dream-on receipts
+with real skill evolution enabled. The deterministic
+`TestPairedFunctionalEvidence` fixture models surface-form-sensitive learning:
+template dreams embed the source phrasing verbatim, so only a literal-match
+rule is learnable and the gate rejects it on a differently phrased held-out
+task, while an accepted LLM paraphrase supplies a second phrasing, the
+optimizer generalizes, and the held-out score moves `0.0 -> 1.0` where the
+dream-off arm stays at `0.0`. The opt-in live driver
+`tests/test_llm_dream_live.py` (`SKILLOPT_TEST_REAL_LLM_DREAM=1`) runs the
+same paired shape against a real Claude or OpenCode CLI backend and writes a
+JSON receipt with per-arm held-out deltas, acceptance/fallback rates, and
+optimizer token cost.
+
+Every LLM-enabled aggregate or per-skill consolidation also emits one
+`llm_dream_summary` evidence row with source/requested/accepted/fallback counts,
+fallback reasons, and the optimizer-token delta for generation plus semantic
+verification. An opt-in live full-cycle check exercises the same contract
+through a factory-built OpenCode optimizer while keeping a mock target isolated:
+
+```bash
+SKILLOPT_TEST_REAL_OPENCODE=1 \
+SKILLOPT_SLEEP_OPENCODE_MODEL=provider/model \
+python -m pytest \
+  tests/test_backend_opencode_live.py::test_real_opencode_optimizer_dream_cycle -q
+```
+
+That test is excluded from ordinary CI because it uses the caller's installed
+OpenCode account and may incur provider charges. When enabled, it requires at
+least one accepted generation, internally consistent acceptance/fallback
+accounting, positive optimizer usage, persisted evidence/staging, target replay,
+and validation non-regression.
 
 ### Paired A/B evalkit
 
