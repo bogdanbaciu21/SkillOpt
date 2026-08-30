@@ -327,7 +327,8 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
             -1,
             f"- adversarial dream probes: {mode} "
             f"(factor={int(cfg.get('dream_adversarial', 0) or 0)}, "
-            f"margin={_report_score(cfg.get('dream_adversarial_margin', 0.0))})",
+            f"margin={_report_score(cfg.get('dream_adversarial_margin', 0.0))}, "
+            f"rollouts={int(cfg.get('dream_adversarial_rollouts', 1) or 1)})",
         )
     gate_on = str(cfg.get("gate_mode", "on")).strip().lower() not in {
         "off", "none", "false", "greedy",
@@ -387,10 +388,11 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
             if isinstance(probe, dict):
                 mode = "blocking" if probe.get("blocking") else "advisory"
                 lines.append(
-                    f"Adversarial probes ({mode}): "
+                    f"Adversarial probes ({mode}, baseline-relative, "
+                    f"rollouts={int(probe.get('rollouts', 1) or 1)}): "
                     f"{int(probe.get('n_flagged', 0) or 0)} flagged / "
                     f"{int(probe.get('n_probes', 0) or 0)} total; "
-                    f"worst delta {_report_score(probe.get('worst_delta'))}."
+                    f"worst gap change {_report_score(probe.get('worst_gap_change'))}."
                 )
                 if not probe.get("conclusive", False):
                     lines.append(
@@ -754,6 +756,9 @@ def run_sleep_cycle(
                 "dream_adversarial_margin": cfg.get(
                     "dream_adversarial_margin", 0.0
                 ),
+                "dream_adversarial_rollouts": cfg.get(
+                    "dream_adversarial_rollouts", 1
+                ),
             })
         cycle_config["opencode_tool_replay"] = (
             cfg.get("opencode_tool_replay", False) is True
@@ -922,6 +927,7 @@ def run_sleep_cycle(
                 "dream_adversarial_blocking", False
             ),
             dream_adversarial_margin=cfg.get("dream_adversarial_margin", 0.0),
+            dream_adversarial_rollouts=cfg.get("dream_adversarial_rollouts", 1),
             edit_budget=cfg.get("edit_budget", 4),
             gate_metric=cfg.get("gate_metric", "mixed"),
             gate_mixed_weight=cfg.get("gate_mixed_weight", 0.5),

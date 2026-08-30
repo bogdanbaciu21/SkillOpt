@@ -18,11 +18,15 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from skillopt_sleep.backend import Backend
 from skillopt_sleep.gate import select_gate_score
-from skillopt_sleep.replay import replay_batch
+from skillopt_sleep.replay import replay_one
 from skillopt_sleep.types import ReplayResult, TaskRecord
 
 MAX_PROBES_PER_TASK = 3
 MAX_ADVERSARIAL_PROBES = 256
+MAX_PROBE_ROLLOUTS = 8
+# Blocking decisions need repeated rollouts so a single stochastic sample can
+# never reject a candidate on its own; advisory runs may use one rollout.
+MIN_BLOCKING_ROLLOUTS = 2
 
 
 def _normalize_split(value: str) -> str:
@@ -30,17 +34,39 @@ def _normalize_split(value: str) -> str:
 
 
 def _strip_polite_frame(intent: str) -> str:
-    """Remove only well-known request boilerplate; keep task semantics intact."""
-    patterns = (
-        r"(?is)^\s*please\s+",
-        r"(?is)^\s*(?:can|could|would)\s+you\s+",
-        r"(?is)^\s*i\s+(?:need|want)\s+you\s+to\s+",
-    )
-    for pattern in patterns:
+    """Reframe explicitly politeness-marked requests, and nothing else.
+
+    Semantic-preservation contract: a transformation is emitted only when the
+    removed prefix is an unambiguous request marker, so removal cannot change
+    what is being asked:
+
+    * a leading ``please`` (a pure politeness marker), and
+    * a leading ``can/could/would you please`` (a modal question that the
+      politeness marker disambiguates as a request; the trailing question
+      mark, if any, becomes a period because the reframed text is the same
+      request in imperative form).
+
+    Bare modal questions (``Can you swim?``, ``Would you like tea?``) are
+    never reframed: without the politeness marker they may ask about ability,
+    permission, or desire, and stripping the modal changes the meaning. The
+    same applies to first-person desire framings (``I want you to ...``),
+    which earlier revisions stripped and this contract deliberately drops.
+    """
+    modal_request = r"(?is)^\s*(?:can|could|would)\s+you\s+please\s+"
+    plain_please = r"(?is)^\s*please\s+"
+    for pattern, reframed_request in ((modal_request, True), (plain_please, False)):
         rewritten, count = re.subn(pattern, "", intent, count=1)
-        if count and rewritten.strip():
-            rewritten = rewritten.strip()
-            return rewritten[:1].upper() + rewritten[1:]
+        if not count or not rewritten.strip():
+            continue
+        rewritten = rewritten.strip()
+        if not rewritten[:1].isalpha():
+            return ""
+        if reframed_request and rewritten.endswith("?"):
+            rewritten = rewritten[:-1].rstrip()
+            if not rewritten or not rewritten[:1].isalpha():
+                return ""
+            rewritten += "."
+        return rewritten[:1].upper() + rewritten[1:]
     return ""
 
 
@@ -135,27 +161,80 @@ def _score(result: ReplayResult, metric: str, mixed_weight: float) -> float | No
     return value if math.isfinite(value) else None
 
 
+def _rollout_scores(
+    backend: Backend,
+    task: TaskRecord,
+    skill: str,
+    memory: str,
+    *,
+    metric: str,
+    mixed_weight: float,
+    rollouts: int,
+) -> List[float | None]:
+    """Score one task ``rollouts`` times under one document pair.
+
+    Each rollout uses a distinct ``sample_id`` so caching backends produce
+    genuinely repeated samples instead of collapsing to one response.
+    """
+    scores: List[float | None] = []
+    for sample_id in range(rollouts):
+        result = replay_one(backend, task, skill, memory, sample_id=sample_id)
+        scores.append(_score(result, metric, mixed_weight))
+    return scores
+
+
+def _mean(values: Sequence[float]) -> float:
+    return sum(values) / len(values)
+
+
 def evaluate_adversarial_probes(
     backend: Backend,
     tasks: Sequence[TaskRecord],
     skill: str,
     memory: str,
     *,
+    baseline_skill: str,
+    baseline_memory: str,
     factor: int = 1,
     metric: str = "mixed",
     mixed_weight: float = 0.5,
     margin: float = 0.0,
+    rollouts: int = 1,
 ) -> Dict[str, Any]:
-    """Score source/probe pairs and return a JSON-safe brittleness report.
+    """Score identical source/probe pairs under the BASELINE and the CANDIDATE
+    documents and report candidate-introduced brittleness.
 
-    A row is flagged when its probe score falls more than ``margin`` below the
-    matching source score. Non-finite scores are invalid and fail closed.
+    Decision rule (documented so the evidence is auditable):
+
+    * every task in every arm is replayed ``rollouts`` times and the arm's
+      score for that task is the MEAN of those rollouts;
+    * per row, ``gap = probe_score - source_score`` is computed for both the
+      baseline arm and the candidate arm, and
+      ``gap_change = candidate_gap - baseline_gap``;
+    * a row is brittle only when ``gap_change < -margin`` AND the per-index
+      paired worsening holds in a strict majority of rollout indices;
+    * any non-finite score in any arm marks the row invalid, which fails
+      closed: invalid rows count as flagged.
+
+    Frame sensitivity already present under the baseline documents therefore
+    never flags a candidate; only the change the candidate introduces does.
+    All four aggregated scores and the per-rollout samples are retained per
+    row so the decision can be audited from the evidence alone. The total
+    replay cost is ``rollouts * 2 * (n_sources + n_probes)``.
     """
     if isinstance(margin, bool) or not isinstance(margin, (int, float)):
         raise ValueError("adversarial probe margin must be a finite number in [0, 1]")
     numeric_margin = float(margin)
     if not math.isfinite(numeric_margin) or not 0.0 <= numeric_margin <= 1.0:
         raise ValueError("adversarial probe margin must be a finite number in [0, 1]")
+    if isinstance(rollouts, bool) or not isinstance(rollouts, int):
+        raise ValueError(
+            f"adversarial probe rollouts must be an integer in [1, {MAX_PROBE_ROLLOUTS}]"
+        )
+    if not 1 <= rollouts <= MAX_PROBE_ROLLOUTS:
+        raise ValueError(
+            f"adversarial probe rollouts must be an integer in [1, {MAX_PROBE_ROLLOUTS}]"
+        )
 
     probes = generate_adversarial_probes(tasks, factor=factor)
     source_by_id = {
@@ -167,32 +246,73 @@ def evaluate_adversarial_probes(
         and "recall" not in (task.tags or [])
     }
     source_ids = list(dict.fromkeys(probe.derived_from for probe in probes))
-    source_tasks = [source_by_id[source_id] for source_id in source_ids]
-    source_pairs = replay_batch(backend, source_tasks, skill, memory)
-    probe_pairs = replay_batch(backend, probes, skill, memory)
-    source_results = {task.id: result for task, result in source_pairs}
+    arms = {
+        "baseline": (baseline_skill, baseline_memory),
+        "candidate": (skill, memory),
+    }
+    source_scores: Dict[str, Dict[str, List[float | None]]] = {}
+    probe_scores: Dict[str, Dict[str, List[float | None]]] = {}
+    for arm, (arm_skill, arm_memory) in arms.items():
+        source_scores[arm] = {
+            source_id: _rollout_scores(
+                backend, source_by_id[source_id], arm_skill, arm_memory,
+                metric=metric, mixed_weight=mixed_weight, rollouts=rollouts,
+            )
+            for source_id in source_ids
+        }
+        probe_scores[arm] = {
+            probe.id: _rollout_scores(
+                backend, probe, arm_skill, arm_memory,
+                metric=metric, mixed_weight=mixed_weight, rollouts=rollouts,
+            )
+            for probe in probes
+        }
 
     rows: List[Dict[str, Any]] = []
     flagged = 0
     invalid = 0
-    deltas: List[float] = []
-    for probe, probe_result in probe_pairs:
-        source_result = source_results.get(probe.derived_from)
-        source_score = (
-            _score(source_result, metric, mixed_weight)
-            if source_result is not None
-            else None
+    gap_changes: List[float] = []
+    for probe in probes:
+        samples = {
+            "baseline_source": source_scores["baseline"][probe.derived_from],
+            "baseline_probe": probe_scores["baseline"][probe.id],
+            "candidate_source": source_scores["candidate"][probe.derived_from],
+            "candidate_probe": probe_scores["candidate"][probe.id],
+        }
+        valid = all(
+            score is not None for scores in samples.values() for score in scores
         )
-        probe_score = _score(probe_result, metric, mixed_weight)
-        valid = source_score is not None and probe_score is not None
-        delta = probe_score - source_score if valid else None
-        is_flagged = not valid or bool(delta is not None and delta < -numeric_margin)
-        if is_flagged:
+        if valid:
+            means = {name: _mean(scores) for name, scores in samples.items()}
+            baseline_gap = means["baseline_probe"] - means["baseline_source"]
+            candidate_gap = means["candidate_probe"] - means["candidate_source"]
+            gap_change = candidate_gap - baseline_gap
+            worsened = sum(
+                1
+                for index in range(rollouts)
+                if (
+                    samples["candidate_probe"][index]
+                    - samples["candidate_source"][index]
+                )
+                - (
+                    samples["baseline_probe"][index]
+                    - samples["baseline_source"][index]
+                )
+                < 0.0
+            )
+            worsening_fraction = worsened / rollouts
+            majority_worsened = worsened * 2 > rollouts
+            is_brittle = gap_change < -numeric_margin and majority_worsened
+            gap_changes.append(gap_change)
+        else:
+            means = {name: None for name in samples}
+            baseline_gap = candidate_gap = gap_change = None
+            worsening_fraction = None
+            is_brittle = True
+        if is_brittle:
             flagged += 1
         if not valid:
             invalid += 1
-        if delta is not None:
-            deltas.append(delta)
         kind = next(
             (tag.removeprefix("probe:") for tag in probe.tags if tag.startswith("probe:")),
             "unknown",
@@ -201,10 +321,16 @@ def evaluate_adversarial_probes(
             "source_task_id": probe.derived_from,
             "probe_task_id": probe.id,
             "probe_kind": kind,
-            "source_score": source_score,
-            "probe_score": probe_score,
-            "delta": delta,
-            "status": "invalid" if not valid else ("brittle" if is_flagged else "stable"),
+            "baseline_source_score": means["baseline_source"],
+            "baseline_probe_score": means["baseline_probe"],
+            "candidate_source_score": means["candidate_source"],
+            "candidate_probe_score": means["candidate_probe"],
+            "baseline_gap": baseline_gap,
+            "candidate_gap": candidate_gap,
+            "gap_change": gap_change,
+            "worsening_fraction": worsening_fraction,
+            "samples": {name: list(scores) for name, scores in samples.items()},
+            "status": "invalid" if not valid else ("brittle" if is_brittle else "stable"),
         })
 
     n = len(rows)
@@ -212,12 +338,13 @@ def evaluate_adversarial_probes(
         "enabled": True,
         "factor": max(0, min(factor, MAX_PROBES_PER_TASK)),
         "margin": numeric_margin,
-        "n_sources": len(source_tasks),
+        "rollouts": rollouts,
+        "n_sources": len(source_ids),
         "n_probes": n,
         "n_flagged": flagged,
         "n_invalid": invalid,
         "brittleness_rate": (flagged / n) if n else 0.0,
-        "worst_delta": min(deltas) if deltas else None,
+        "worst_gap_change": min(gap_changes) if gap_changes else None,
         "conclusive": n > 0,
         "flagged": flagged > 0,
         "rows": rows,

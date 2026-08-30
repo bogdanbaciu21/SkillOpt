@@ -40,7 +40,7 @@ duplicated as a per-skill row.
 
 Each group inherits `recall_k`, `dream_rollouts`, `dream_factor`,
 `dream_adversarial`, `dream_adversarial_blocking`,
-`dream_adversarial_margin`, `edit_budget`,
+`dream_adversarial_margin`, `dream_adversarial_rollouts`, `edit_budget`,
 `gate_mode`, `gate_metric`, `gate_mixed_weight`, `gate_no_regression`, and
 `evolve_skill`. Recalled archive tasks are restricted to the same skill hint,
 and shared memory is read-only during group runs. Consequently,
