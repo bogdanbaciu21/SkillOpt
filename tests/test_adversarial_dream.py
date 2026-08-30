@@ -166,6 +166,8 @@ def test_probe_report_flags_a_planted_literal_surface_rule() -> None:
         [_task("train")],
         _CandidateBackend.RULE,
         "",
+        baseline_skill="",
+        baseline_memory="",
         factor=2,
     )
 
@@ -173,8 +175,14 @@ def test_probe_report_flags_a_planted_literal_surface_rule() -> None:
     assert report["n_probes"] == 2
     assert report["n_flagged"] == 2
     assert report["brittleness_rate"] == 1.0
-    assert report["worst_delta"] == -1.0
+    assert report["worst_gap_change"] == -1.0
     assert {row["status"] for row in report["rows"]} == {"brittle"}
+    for row in report["rows"]:
+        assert row["baseline_source_score"] == 0.0
+        assert row["baseline_probe_score"] == 0.0
+        assert row["candidate_source_score"] == 1.0
+        assert row["candidate_probe_score"] == 0.0
+        assert row["gap_change"] == -1.0
 
 
 def test_probe_report_keeps_a_surface_robust_rule_stable() -> None:
@@ -183,12 +191,14 @@ def test_probe_report_keeps_a_surface_robust_rule_stable() -> None:
         [_task("train")],
         _CandidateBackend.RULE,
         "",
+        baseline_skill="",
+        baseline_memory="",
         factor=3,
     )
 
     assert report["n_flagged"] == 0
     assert report["flagged"] is False
-    assert report["worst_delta"] == 0.0
+    assert report["worst_gap_change"] == 0.0
     assert {row["status"] for row in report["rows"]} == {"stable"}
 
 
@@ -202,11 +212,14 @@ def test_dual_backend_probes_route_attempts_and_exact_judging_to_target() -> Non
         [_task("train")],
         _CandidateBackend.RULE,
         "",
+        baseline_skill="",
+        baseline_memory="",
     )
 
     assert report["flagged"] is False
-    assert target.attempt_calls == 2  # source + one probe
-    assert target.judge_calls == 2
+    # source + one probe, each scored under the baseline AND candidate arms
+    assert target.attempt_calls == 4
+    assert target.judge_calls == 4
     assert optimizer.attempt_calls == 0
     assert optimizer.judge_calls == 0
 
@@ -217,11 +230,14 @@ def test_non_finite_probe_score_is_json_safe_and_fails_closed() -> None:
         [_task("train")],
         _CandidateBackend.RULE,
         "",
+        baseline_skill="",
+        baseline_memory="",
     )
 
     assert report["flagged"] is True
     assert report["n_invalid"] == 1
-    assert report["rows"][0]["probe_score"] is None
+    assert report["rows"][0]["candidate_probe_score"] is None
+    assert report["rows"][0]["gap_change"] is None
     assert report["rows"][0]["status"] == "invalid"
     json.dumps(report, allow_nan=False)
 
@@ -234,6 +250,8 @@ def test_probe_margin_rejects_non_finite_or_out_of_range_values(margin) -> None:
             [_task("train")],
             _CandidateBackend.RULE,
             "",
+        baseline_skill="",
+        baseline_memory="",
             margin=margin,
         )
 
@@ -253,6 +271,26 @@ def test_probe_margin_rejects_non_finite_or_out_of_range_values(margin) -> None:
         (
             {"dream_adversarial": 1, "dream_adversarial_margin": float("inf")},
             "finite number",
+        ),
+        (
+            {"dream_adversarial": 1, "dream_adversarial_rollouts": True},
+            "rollouts must be an integer",
+        ),
+        (
+            {"dream_adversarial": 1, "dream_adversarial_rollouts": 0},
+            "rollouts must be an integer",
+        ),
+        (
+            {"dream_adversarial": 1, "dream_adversarial_rollouts": 99},
+            "rollouts must be an integer",
+        ),
+        (
+            {
+                "dream_adversarial": 1,
+                "dream_adversarial_blocking": True,
+                "dream_adversarial_rollouts": 1,
+            },
+            "blocking requires",
         ),
     ],
 )
@@ -323,6 +361,7 @@ def test_blocking_probe_rejects_candidate_that_passed_the_held_out_gate() -> Non
         evolve_memory=False,
         dream_adversarial=2,
         dream_adversarial_blocking=True,
+        dream_adversarial_rollouts=2,
     )
 
     assert result.accepted is False
@@ -344,6 +383,7 @@ def test_blocking_probe_fails_closed_when_no_eligible_variant_exists() -> None:
         evolve_memory=False,
         dream_adversarial=1,
         dream_adversarial_blocking=True,
+        dream_adversarial_rollouts=2,
     )
 
     assert result.accepted is False
@@ -424,6 +464,190 @@ def test_cycle_persists_advisory_probe_evidence_in_review_artifacts(tmp_path) ->
     assert diagnostics["gate_trials"] == outcome.report.gate_trials
     assert diagnostics["gate_trials"][0]["adversarial_probe"]["n_flagged"] == 2
     assert "adversarial dream probes: advisory" in markdown
-    assert "Adversarial probes (advisory): 2 flagged / 2 total" in markdown
+    assert (
+        "Adversarial probes (advisory, baseline-relative, rollouts=1): "
+        "2 flagged / 2 total" in markdown
+    )
     assert "<script>" not in markdown
     assert "&lt;script&gt;" in markdown
+
+
+class _EquallySensitiveBackend(_CandidateBackend):
+    """Frame sensitivity exists identically with and without the candidate."""
+
+    def attempt(self, task, skill, memory, sample_id=0):
+        return task.reference if task.intent in self.HARVESTED_INTENTS else "wrong"
+
+
+class _ImprovesBothKeepsGapBackend(MockBackend):
+    """The candidate improves source AND probe but keeps the pre-existing gap."""
+
+    SCORES = {
+        (False, False): 0.4,   # baseline arm, source task
+        (False, True): 0.1,    # baseline arm, probe task
+        (True, False): 0.9,    # candidate arm, source task
+        (True, True): 0.6,     # candidate arm, probe task
+    }
+
+    def attempt(self, task, skill, memory, sample_id=0):
+        has_rule = _CandidateBackend.RULE in f"{skill}\n{memory}"
+        return f"marker:{int(has_rule)}:{int(task.origin == 'dream')}"
+
+    def judge(self, task, response):
+        _, has_rule, is_probe = response.split(":")
+        value = self.SCORES[(has_rule == "1", is_probe == "1")]
+        return value, value, "graded fixture"
+
+
+class _SingleFluctuationBackend(MockBackend):
+    """One probe rollout dips under the candidate; the repeat does not."""
+
+    def attempt(self, task, skill, memory, sample_id=0):
+        has_rule = _CandidateBackend.RULE in f"{skill}\n{memory}"
+        dips = has_rule and task.origin == "dream" and sample_id == 0
+        return f"marker:{int(dips)}"
+
+    def judge(self, task, response):
+        value = 0.8 if response.endswith(":1") else 1.0
+        return value, value, "graded fixture"
+
+
+def test_equal_frame_sensitivity_in_baseline_and_candidate_is_not_flagged() -> None:
+    report = evaluate_adversarial_probes(
+        _EquallySensitiveBackend(),
+        [_task("train")],
+        _CandidateBackend.RULE,
+        "",
+        baseline_skill="",
+        baseline_memory="",
+        factor=2,
+        rollouts=2,
+    )
+
+    assert report["n_flagged"] == 0
+    assert report["flagged"] is False
+    for row in report["rows"]:
+        assert row["baseline_gap"] == row["candidate_gap"]
+        assert row["gap_change"] == 0.0
+        assert row["status"] == "stable"
+
+
+def test_candidate_that_improves_both_but_keeps_the_gap_is_not_flagged() -> None:
+    report = evaluate_adversarial_probes(
+        _ImprovesBothKeepsGapBackend(),
+        [_task("train")],
+        _CandidateBackend.RULE,
+        "",
+        baseline_skill="",
+        baseline_memory="",
+        factor=2,
+        rollouts=2,
+    )
+
+    assert report["flagged"] is False
+    for row in report["rows"]:
+        assert row["candidate_source_score"] > row["baseline_source_score"]
+        assert row["candidate_probe_score"] > row["baseline_probe_score"]
+        assert row["gap_change"] == 0.0
+        assert row["status"] == "stable"
+
+
+def test_single_rollout_fluctuation_never_flags_under_majority_rule() -> None:
+    report = evaluate_adversarial_probes(
+        _SingleFluctuationBackend(),
+        [_task("train")],
+        _CandidateBackend.RULE,
+        "",
+        baseline_skill="",
+        baseline_memory="",
+        factor=1,
+        rollouts=2,
+    )
+
+    row = report["rows"][0]
+    assert row["gap_change"] < 0.0
+    assert row["worsening_fraction"] == 0.5
+    assert row["status"] == "stable"
+    assert report["flagged"] is False
+
+
+def test_evidence_rows_retain_all_four_scores_and_samples() -> None:
+    report = evaluate_adversarial_probes(
+        _CandidateBackend(),
+        [_task("train")],
+        _CandidateBackend.RULE,
+        "",
+        baseline_skill="",
+        baseline_memory="",
+        factor=1,
+        rollouts=2,
+    )
+
+    row = report["rows"][0]
+    for key in (
+        "baseline_source_score",
+        "baseline_probe_score",
+        "candidate_source_score",
+        "candidate_probe_score",
+        "baseline_gap",
+        "candidate_gap",
+        "gap_change",
+        "worsening_fraction",
+    ):
+        assert key in row
+    for arm in (
+        "baseline_source",
+        "baseline_probe",
+        "candidate_source",
+        "candidate_probe",
+    ):
+        assert len(row["samples"][arm]) == 2
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize("rollouts", [True, 0, -1, 9, 1.5, "2"])
+def test_probe_rollouts_rejects_out_of_range_or_ambiguous_values(rollouts) -> None:
+    with pytest.raises(ValueError, match="rollouts must be an integer"):
+        evaluate_adversarial_probes(
+            _RobustCandidateBackend(),
+            [_task("train")],
+            _CandidateBackend.RULE,
+            "",
+        baseline_skill="",
+        baseline_memory="",
+            rollouts=rollouts,
+        )
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        "Can you swim?",
+        "Could you ever forgive me?",
+        "Would you like some tea?",
+        "Can you believe the score?",
+        "I want you to know this matters.",
+        "I need you to be honest with me.",
+    ],
+)
+def test_polite_frame_never_reframes_ability_permission_or_desire(intent) -> None:
+    from skillopt_sleep.adversarial import _strip_polite_frame, _variant_intents
+
+    assert _strip_polite_frame(intent) == ""
+    assert all(kind != "request-frame" for kind, _ in _variant_intents(intent))
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        ("Please add validation to the signup page", "Add validation to the signup page"),
+        ("please return ok", "Return ok"),
+        ("Could you please add input validation?", "Add input validation."),
+        ("can you please rerun the failing job", "Rerun the failing job"),
+        ("Please can you swim?", "Can you swim?"),
+    ],
+)
+def test_polite_frame_reframes_only_politeness_marked_requests(intent, expected) -> None:
+    from skillopt_sleep.adversarial import _strip_polite_frame
+
+    assert _strip_polite_frame(intent) == expected

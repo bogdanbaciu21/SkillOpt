@@ -12,7 +12,11 @@ import math
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
-from skillopt_sleep.adversarial import evaluate_adversarial_probes
+from skillopt_sleep.adversarial import (
+    MAX_PROBE_ROLLOUTS,
+    MIN_BLOCKING_ROLLOUTS,
+    evaluate_adversarial_probes,
+)
 from skillopt_sleep.backend import Backend
 
 # Self-contained validation gate (vendored from SkillOpt; zero dependency on the
@@ -191,6 +195,7 @@ def consolidate(
     dream_adversarial: int = 0,
     dream_adversarial_blocking: bool = False,
     dream_adversarial_margin: float = 0.0,
+    dream_adversarial_rollouts: int = 1,
     gate_mode: str = "on",       # "on" (hard/soft per gate_metric) | "off" (greedy)
     rollouts_k: int = 1,         # >1 => multi-rollout contrastive reflection
     evolve_skill: bool = True,
@@ -223,6 +228,28 @@ def consolidate(
         if not math.isfinite(margin) or not 0.0 <= margin <= 1.0:
             raise ValueError(
                 "dream_adversarial_margin must be a finite number in [0, 1]"
+            )
+        if isinstance(dream_adversarial_rollouts, bool) or not isinstance(
+            dream_adversarial_rollouts, int
+        ):
+            raise ValueError(
+                "dream_adversarial_rollouts must be an integer in "
+                f"[1, {MAX_PROBE_ROLLOUTS}]"
+            )
+        if not 1 <= dream_adversarial_rollouts <= MAX_PROBE_ROLLOUTS:
+            raise ValueError(
+                "dream_adversarial_rollouts must be an integer in "
+                f"[1, {MAX_PROBE_ROLLOUTS}]"
+            )
+        if (
+            dream_adversarial_blocking
+            and dream_adversarial_rollouts < MIN_BLOCKING_ROLLOUTS
+        ):
+            raise ValueError(
+                "dream_adversarial_blocking requires "
+                f"dream_adversarial_rollouts >= {MIN_BLOCKING_ROLLOUTS} so a "
+                "single stochastic sample can never reject a candidate; keep "
+                "the probes advisory for single-rollout runs"
             )
     from skillopt_sleep import evidence as evlog
     ev = evlog.get(backend)
@@ -295,10 +322,13 @@ def consolidate(
                 train_tasks,
                 trial_skill,
                 trial_memory,
+                baseline_skill=cand_skill,
+                baseline_memory=cand_memory,
                 factor=dream_adversarial,
                 metric=gate_metric,
                 mixed_weight=gate_mixed_weight,
                 margin=dream_adversarial_margin,
+                rollouts=dream_adversarial_rollouts,
             )
             blocked = bool(
                 dream_adversarial_blocking
