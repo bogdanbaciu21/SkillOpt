@@ -31,7 +31,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Clone and verify immutable candidate
         env:
-          EXPECTED_SHA: dfabedec9a134f6420f2f9339c927cea7fdb1811
+          EXPECTED_SHA: 760982a475342aacb416bf37bb1f92d14b9fffa9
         run: |
           set -euo pipefail
           git clone --quiet --depth 1 --branch exc-003-v2 https://github.com/bogdanbaciu21/SkillOpt skillopt
