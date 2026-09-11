@@ -1029,6 +1029,9 @@ def run_sleep_cycle(
                     dream_adversarial_margin=cfg.get(
                         "dream_adversarial_margin", 0.0
                     ),
+                    dream_adversarial_rollouts=cfg.get(
+                        "dream_adversarial_rollouts", 1
+                    ),
                     edit_budget=cfg.get("edit_budget", 4),
                     gate_metric=cfg.get("gate_metric", "mixed"),
                     gate_mixed_weight=cfg.get("gate_mixed_weight", 0.5),
@@ -1122,6 +1125,9 @@ def run_sleep_cycle(
                             ),
                             "dream_adversarial_margin": cfg.get(
                                 "dream_adversarial_margin", 0.0
+                            ),
+                            "dream_adversarial_rollouts": cfg.get(
+                                "dream_adversarial_rollouts", 1
                             ),
                         } if int(cfg.get("dream_adversarial", 0) or 0) > 0 else {}),
                         "n_tasks": len(tasks),

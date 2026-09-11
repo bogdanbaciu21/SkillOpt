@@ -437,6 +437,7 @@ def test_cycle_persists_advisory_probe_evidence_in_review_artifacts(tmp_path) ->
         dream_adversarial=2,
         dream_adversarial_blocking=False,
         dream_adversarial_margin=0.015,
+        dream_adversarial_rollouts=2,
         auto_adopt=False,
     )
 
@@ -461,15 +462,51 @@ def test_cycle_persists_advisory_probe_evidence_in_review_artifacts(tmp_path) ->
     assert diagnostics["dream_adversarial"] == 2
     assert diagnostics["dream_adversarial_blocking"] is False
     assert diagnostics["dream_adversarial_margin"] == 0.015
+    assert diagnostics["dream_adversarial_rollouts"] == 2
     assert diagnostics["gate_trials"] == outcome.report.gate_trials
     assert diagnostics["gate_trials"][0]["adversarial_probe"]["n_flagged"] == 2
     assert "adversarial dream probes: advisory" in markdown
     assert (
-        "Adversarial probes (advisory, baseline-relative, rollouts=1): "
+        "Adversarial probes (advisory, baseline-relative, rollouts=2): "
         "2 flagged / 2 total" in markdown
     )
     assert "<script>" not in markdown
     assert "&lt;script&gt;" in markdown
+
+
+def test_multi_skill_cycle_keeps_blocking_probe_rollouts(tmp_path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    claude_home = tmp_path / ".claude"
+    skill_dir = claude_home / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# demo skill\n", encoding="utf-8")
+    config = load_config(
+        invoked_project=str(project),
+        projects="invoked",
+        backend="mock",
+        state_dir=str(tmp_path / "state"),
+        claude_home=str(claude_home),
+        managed_skill_name="skillopt-sleep-learned",
+        multi_skill_fanout=True,
+        evolve_memory=False,
+        dream_adversarial=1,
+        dream_adversarial_blocking=True,
+        dream_adversarial_rollouts=2,
+        auto_adopt=False,
+    )
+
+    outcome = run_sleep_cycle(
+        config,
+        seed_tasks=_candidate_tasks(),
+        backend=_RobustCandidateBackend(),
+    )
+
+    assert len(outcome.report.skill_groups) == 1
+    group = outcome.report.skill_groups[0]
+    assert group.skill_name == "demo-skill"
+    assert group.status == "consolidated"
+    assert group.accepted is True
 
 
 class _EquallySensitiveBackend(_CandidateBackend):
