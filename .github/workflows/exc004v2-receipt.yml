@@ -2,6 +2,21 @@ name: exc004v2-validation
 
 on:
   workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: Fork branch to verify
+        required: true
+        default: exc-004-adversarial-probes
+      expected_sha:
+        description: Exact candidate commit
+        required: true
+        default: 4d93cad055f9210438867d02c8e7c24236902040
+      focused_suite:
+        description: Focused regression slice
+        required: true
+        type: choice
+        options: [adversarial, gate]
+        default: adversarial
   push:
     branches: [ci/exc004v2-receipt]
 
@@ -31,10 +46,11 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Clone and verify immutable candidate
         env:
-          EXPECTED_SHA: 84bbde9ac19113bf4dee29dbfbf0755aacde6b36
+          EXPECTED_SHA: ${{ inputs.expected_sha || '4d93cad055f9210438867d02c8e7c24236902040' }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref || 'exc-004-adversarial-probes' }}
         run: |
           set -euo pipefail
-          git clone --quiet --depth 1 --branch exc-004-v2 https://github.com/bogdanbaciu21/SkillOpt skillopt
+          git clone --quiet --depth 1 --branch "$CANDIDATE_REF" https://github.com/bogdanbaciu21/SkillOpt skillopt
           cd skillopt
           ACTUAL_SHA="$(git rev-parse HEAD)"
           echo "platform=$(uname -srm)"
@@ -51,11 +67,17 @@ jobs:
           "$PY" -m pip install --disable-pip-version-check -q -e ".[dev,docs]" pytest-timeout
           "$PY" --version
       - name: Run focused feature and integration regressions
+        env:
+          FOCUSED_SUITE: ${{ inputs.focused_suite || 'adversarial' }}
         run: |
           set -euo pipefail
           cd skillopt
           if [ -x .venv/Scripts/python.exe ]; then PY=.venv/Scripts/python.exe; else PY=.venv/bin/python; fi
-          "$PY" -m pytest tests/test_adversarial_dream.py tests/test_sleep_engine.py tests/test_gate_no_regression.py tests/test_consolidate_split.py tests/test_split_hardening_2x3.py -q --timeout=120 --timeout-method=thread
+          if [ "$FOCUSED_SUITE" = gate ]; then
+            "$PY" -m pytest tests/test_gate.py -q --timeout=120 --timeout-method=thread
+          else
+            "$PY" -m pytest tests/test_adversarial_dream.py tests/test_sleep_engine.py tests/test_gate_no_regression.py tests/test_consolidate_split.py tests/test_split_hardening_2x3.py -q --timeout=120 --timeout-method=thread
+          fi
       - name: Run entire repository test suite
         run: |
           set -euo pipefail
