@@ -400,19 +400,25 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
                         "closed for this candidate."
                     )
                 lines.append("")
-                lines.append("| Source | Probe | Variant | Source | Probe | Delta | Status |")
-                lines.append("|---|---|---|---:|---:|---:|---|")
+                lines.append(
+                    "| Source | Probe | Variant | Baseline source | Baseline probe | "
+                    "Candidate source | Candidate probe | Gap change | Status |"
+                )
+                lines.append("|---|---|---|---:|---:|---:|---:|---:|---|")
                 for row in probe.get("rows", []):
                     source_id = _markdown_table_text(row.get("source_task_id", ""))
                     probe_id = _markdown_table_text(row.get("probe_task_id", ""))
                     kind = _markdown_table_text(row.get("probe_kind", ""))
-                    source_score = _report_score(row.get("source_score"))
-                    probe_score = _report_score(row.get("probe_score"))
-                    delta = _report_score(row.get("delta"))
+                    baseline_source = _report_score(row.get("baseline_source_score"))
+                    baseline_probe = _report_score(row.get("baseline_probe_score"))
+                    candidate_source = _report_score(row.get("candidate_source_score"))
+                    candidate_probe = _report_score(row.get("candidate_probe_score"))
+                    gap_change = _report_score(row.get("gap_change"))
                     status = _markdown_table_text(row.get("status", ""))
                     lines.append(
                         f"| `{source_id}` | `{probe_id}` | {kind} | "
-                        f"{source_score} | {probe_score} | {delta} | {status} |"
+                        f"{baseline_source} | {baseline_probe} | "
+                        f"{candidate_source} | {candidate_probe} | {gap_change} | {status} |"
                     )
                 lines.append("")
     if report.edits:

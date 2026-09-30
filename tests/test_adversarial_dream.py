@@ -509,6 +509,58 @@ def test_multi_skill_cycle_keeps_blocking_probe_rollouts(tmp_path) -> None:
     assert group.accepted is True
 
 
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+@pytest.mark.parametrize(
+    ("backend_type", "probe_score", "gap_change", "status"),
+    [
+        (_CandidateBackend, 0.0, -1.0, "brittle"),
+        (_RobustCandidateBackend, 1.0, 0.0, "stable"),
+    ],
+    ids=["brittle", "robust"],
+)
+def test_cycle_report_renders_baseline_relative_probe_scores(
+    tmp_path, blocking, backend_type, probe_score, gap_change, status
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    config = load_config(
+        invoked_project=str(project),
+        projects="invoked",
+        backend="mock",
+        state_dir=str(tmp_path / "state"),
+        claude_home=str(tmp_path / ".claude"),
+        evolve_memory=False,
+        dream_adversarial=1,
+        dream_adversarial_blocking=blocking,
+        dream_adversarial_rollouts=2,
+        auto_adopt=False,
+    )
+
+    outcome = run_sleep_cycle(
+        config, seed_tasks=_candidate_tasks(), backend=backend_type()
+    )
+
+    row = outcome.report.gate_trials[0]["adversarial_probe"]["rows"][0]
+    assert row["baseline_source_score"] == 0.0
+    assert row["baseline_probe_score"] == 0.0
+    assert row["candidate_source_score"] == 1.0
+    assert row["candidate_probe_score"] == probe_score
+    assert row["gap_change"] == gap_change
+    assert row["status"] == status
+    with open(
+        os.path.join(outcome.staging_dir, "report.md"), encoding="utf-8"
+    ) as handle:
+        markdown = handle.read()
+    assert (
+        "| Source | Probe | Variant | Baseline source | Baseline probe | "
+        "Candidate source | Candidate probe | Gap change | Status |"
+    ) in markdown
+    assert (
+        "| `train` | `train_adversarial_request-frame` | request-frame | "
+        f"0.000 | 0.000 | 1.000 | {probe_score:.3f} | {gap_change:.3f} | {status} |"
+    ) in markdown
+
+
 class _EquallySensitiveBackend(_CandidateBackend):
     """Frame sensitivity exists identically with and without the candidate."""
 
