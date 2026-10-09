@@ -336,11 +336,14 @@ def consolidate(
             )
             probe["blocking"] = bool(dream_adversarial_blocking)
             probe["blocked"] = blocked
-            probe["block_reason"] = (
-                "inconclusive_no_probes"
-                if blocked and not probe["conclusive"]
-                else ("brittle_score_drop" if blocked else "")
-            )
+            if not blocked:
+                probe["block_reason"] = ""
+            elif probe["conclusive"]:
+                probe["block_reason"] = "brittle_score_drop"
+            elif probe["n_probes"]:
+                probe["block_reason"] = "inconclusive_repeated_samples_unsupported"
+            else:
+                probe["block_reason"] = "inconclusive_no_probes"
             if ev is not None:
                 ev.log(
                     "adversarial",

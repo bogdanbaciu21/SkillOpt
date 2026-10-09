@@ -394,9 +394,19 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
                     f"{int(probe.get('n_probes', 0) or 0)} total; "
                     f"worst gap change {_report_score(probe.get('worst_gap_change'))}."
                 )
+                n_inconclusive = int(probe.get("n_inconclusive", 0) or 0)
+                if n_inconclusive:
+                    lines.append(
+                        f"{n_inconclusive} probe(s) inconclusive: their replay route "
+                        "cannot produce distinct repeated samples, so they were not "
+                        "scored and cannot flag the candidate."
+                    )
                 if not probe.get("conclusive", False):
                     lines.append(
-                        "No eligible probe was generated; blocking mode fails "
+                        "No conclusive probe was scored; blocking mode fails "
+                        "closed for this candidate."
+                        if int(probe.get("n_probes", 0) or 0)
+                        else "No eligible probe was generated; blocking mode fails "
                         "closed for this candidate."
                     )
                 lines.append("")

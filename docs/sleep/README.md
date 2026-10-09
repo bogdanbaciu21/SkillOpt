@@ -362,11 +362,22 @@ indices. All four aggregated scores and the per-rollout samples are retained
 in the evidence so the decision is auditable. Any non-finite score fails
 closed.
 
+Repeated rollouts are only evidence when they are distinct samples. Every
+replay route forwards the rollout's `sample_id`: the text route and the
+inherited `TOOL_CALL:` marker fallback salt the attempt cache key with it, and
+the real tool-loop backends start a fresh, uncached agent process per call.
+A custom backend whose `attempt` or `attempt_with_tools` does not accept
+`sample_id` cannot provide that guarantee, so with more than one rollout its
+rows are reported as `inconclusive` and not replayed. Inconclusive rows never
+flag a candidate; if no conclusive row remains, blocking mode fails closed and
+names the unsupported route in `block_reason`.
+
 Probes are advisory first because any fixed robustness suite is an incomplete
 proxy; enable blocking only after reviewing the advisory evidence and
 calibrating the margin on your task mix. Blocking mode fails closed if no
 eligible probe can be generated. The replay cost per gate-eligible candidate
-is `rollouts * 2 * (sources + probes)`, so token and latency cost grow with
+is `rollouts * 2 * (sources + probes)` over the conclusive rows, so token and
+latency cost grow with
 the number of real training tasks, the factor, and the rollout count.
 
 Example `~/.skillopt-sleep/config.json`:

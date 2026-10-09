@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from skillopt_sleep.backend import Backend
 from skillopt_sleep.gate import select_gate_score
-from skillopt_sleep.replay import replay_one
+from skillopt_sleep.replay import repeated_samples_distinct, replay_one
 from skillopt_sleep.types import ReplayResult, TaskRecord
 
 MAX_PROBES_PER_TASK = 3
@@ -214,13 +214,21 @@ def evaluate_adversarial_probes(
     * a row is brittle only when ``gap_change < -margin`` AND the per-index
       paired worsening holds in a strict majority of rollout indices;
     * any non-finite score in any arm marks the row invalid, which fails
-      closed: invalid rows count as flagged.
+      closed: invalid rows count as flagged;
+    * with ``rollouts > 1``, a row whose route cannot obtain distinct
+      repeated samples (see ``repeated_samples_distinct``) is not replayed
+      and is marked ``inconclusive``: repeated copies of one response would
+      claim a confidence the evidence does not have. Inconclusive rows are
+      never flagged, and when no conclusive row remains the result is
+      ``conclusive=False``, which blocking mode treats as a fail-closed
+      rejection.
 
     Frame sensitivity already present under the baseline documents therefore
     never flags a candidate; only the change the candidate introduces does.
     All four aggregated scores and the per-rollout samples are retained per
     row so the decision can be audited from the evidence alone. The total
-    replay cost is ``rollouts * 2 * (n_sources + n_probes)``.
+    replay cost is ``rollouts * 2 * (sources + probes)`` over the conclusive
+    rows and the sources they reference.
     """
     if isinstance(margin, bool) or not isinstance(margin, (int, float)):
         raise ValueError("adversarial probe margin must be a finite number in [0, 1]")
@@ -246,6 +254,20 @@ def evaluate_adversarial_probes(
         and "recall" not in (task.tags or [])
     }
     source_ids = list(dict.fromkeys(probe.derived_from for probe in probes))
+    # A single rollout makes no independence claim. Repeated rollouts must
+    # reach the model as distinct samples on BOTH tasks of a pair; a probe
+    # keeps its source's judge, so both normally share one route.
+    distinct = {
+        probe.id: rollouts == 1 or (
+            repeated_samples_distinct(backend, source_by_id[probe.derived_from])
+            and repeated_samples_distinct(backend, probe)
+        )
+        for probe in probes
+    }
+    scored_probes = [probe for probe in probes if distinct[probe.id]]
+    scored_source_ids = list(
+        dict.fromkeys(probe.derived_from for probe in scored_probes)
+    )
     arms = {
         "baseline": (baseline_skill, baseline_memory),
         "candidate": (skill, memory),
@@ -258,21 +280,46 @@ def evaluate_adversarial_probes(
                 backend, source_by_id[source_id], arm_skill, arm_memory,
                 metric=metric, mixed_weight=mixed_weight, rollouts=rollouts,
             )
-            for source_id in source_ids
+            for source_id in scored_source_ids
         }
         probe_scores[arm] = {
             probe.id: _rollout_scores(
                 backend, probe, arm_skill, arm_memory,
                 metric=metric, mixed_weight=mixed_weight, rollouts=rollouts,
             )
-            for probe in probes
+            for probe in scored_probes
         }
 
     rows: List[Dict[str, Any]] = []
     flagged = 0
     invalid = 0
+    inconclusive = 0
     gap_changes: List[float] = []
     for probe in probes:
+        kind = next(
+            (tag.removeprefix("probe:") for tag in probe.tags if tag.startswith("probe:")),
+            "unknown",
+        )
+        if not distinct[probe.id]:
+            inconclusive += 1
+            rows.append({
+                "source_task_id": probe.derived_from,
+                "probe_task_id": probe.id,
+                "probe_kind": kind,
+                "baseline_source_score": None,
+                "baseline_probe_score": None,
+                "candidate_source_score": None,
+                "candidate_probe_score": None,
+                "baseline_gap": None,
+                "candidate_gap": None,
+                "gap_change": None,
+                "worsening_fraction": None,
+                "samples": {},
+                "distinct_samples": False,
+                "inconclusive_reason": "repeated_samples_unsupported",
+                "status": "inconclusive",
+            })
+            continue
         samples = {
             "baseline_source": source_scores["baseline"][probe.derived_from],
             "baseline_probe": probe_scores["baseline"][probe.id],
@@ -313,10 +360,6 @@ def evaluate_adversarial_probes(
             flagged += 1
         if not valid:
             invalid += 1
-        kind = next(
-            (tag.removeprefix("probe:") for tag in probe.tags if tag.startswith("probe:")),
-            "unknown",
-        )
         rows.append({
             "source_task_id": probe.derived_from,
             "probe_task_id": probe.id,
@@ -330,10 +373,12 @@ def evaluate_adversarial_probes(
             "gap_change": gap_change,
             "worsening_fraction": worsening_fraction,
             "samples": {name: list(scores) for name, scores in samples.items()},
+            "distinct_samples": True,
             "status": "invalid" if not valid else ("brittle" if is_brittle else "stable"),
         })
 
     n = len(rows)
+    scored = n - inconclusive
     return {
         "enabled": True,
         "factor": max(0, min(factor, MAX_PROBES_PER_TASK)),
@@ -343,9 +388,10 @@ def evaluate_adversarial_probes(
         "n_probes": n,
         "n_flagged": flagged,
         "n_invalid": invalid,
-        "brittleness_rate": (flagged / n) if n else 0.0,
+        "n_inconclusive": inconclusive,
+        "brittleness_rate": (flagged / scored) if scored else 0.0,
         "worst_gap_change": min(gap_changes) if gap_changes else None,
-        "conclusive": n > 0,
+        "conclusive": scored > 0,
         "flagged": flagged > 0,
         "rows": rows,
     }

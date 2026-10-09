@@ -740,3 +740,382 @@ def test_polite_frame_reframes_only_politeness_marked_requests(intent, expected)
     from skillopt_sleep.adversarial import _strip_polite_frame
 
     assert _strip_polite_frame(intent) == expected
+
+
+# ── Repeated-sample independence on tool and text routes ─────────────────────
+
+_PI_RULE = "Always call the search tool and finish with VERIFIED."
+_PI_INTENTS = (
+    "Please look up the current release notes before answering",
+    "Please check the changelog for the latest breaking change",
+    "Please find the deprecation date of the old endpoint",
+    "Please confirm which version introduced the retry flag",
+)
+_PI_CHECKS = {
+    "tool": {"op": "tool_called", "arg": "search"},
+    "text": {"op": "contains", "arg": "VERIFIED"},
+}
+
+
+class _FakePiProvider:
+    """Stands in for the Pi child process, the only faked boundary.
+
+    The miner, reflection, replay, cache, gate, probes, and report all run the
+    shipped code. Each call is recorded so tests can count what actually
+    reached the provider. The first candidate-probe call of the probe phase
+    fails once; every other candidate call succeeds and baseline calls fail.
+    """
+
+    GOOD = "TOOL_CALL: search\nVERIFIED"
+    BAD = "I answered from memory."
+
+    def __init__(self, backend, check) -> None:
+        self.backend = backend
+        self.check = check
+        self.probe_calls: list[tuple[str, str]] = []
+        self.failed_once = False
+
+    def __call__(self, cmd, *, input, **kwargs):
+        import subprocess
+
+        prompt = input
+        if prompt.startswith("You are mining"):
+            intent = next(text for text in _PI_INTENTS if text in prompt)
+            out = json.dumps(
+                [{"intent": intent, "checks": [self.check], "satisfied": False}]
+            )
+        elif prompt.startswith("You are SkillOpt's optimizer"):
+            current = prompt.split("# Recurring failures", 1)[0]
+            out = "[]" if _PI_RULE in current else json.dumps(
+                [{"op": "add", "content": _PI_RULE, "rationale": "fixture"}]
+            )
+        elif prompt.startswith("Complete the following task"):
+            candidate = _PI_RULE in prompt
+            out = self.GOOD if candidate else self.BAD
+            if self.backend.evidence_phase.startswith("adversarial_probe"):
+                arm = "candidate" if candidate else "baseline"
+                role = (
+                    "source" if any(text in prompt for text in _PI_INTENTS) else "probe"
+                )
+                self.probe_calls.append((arm, role))
+                if candidate and role == "probe" and not self.failed_once:
+                    self.failed_once = True
+                    out = self.BAD
+        else:
+            out = "{}"
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+
+@pytest.mark.parametrize("route", ["tool", "text"])
+def test_miner_derived_pi_cycle_obtains_distinct_probe_rollouts(tmp_path, route) -> None:
+    """A miner-produced task replayed through the shipped Pi backend must give
+    each probe rollout its own provider sample on both routes.
+
+    Before the fix, the inherited tool fallback dropped ``sample_id`` and served
+    every rollout from the sample-zero cache entry: one failed candidate-probe
+    response counted as three failures and blocked a candidate that the text
+    route (the positive control) accepts.
+    """
+    from collections import Counter
+    from unittest import mock
+
+    from skillopt_sleep.backend import PiCliBackend
+    from skillopt_sleep.llm_miner import make_llm_miner
+    from skillopt_sleep.mine import mine
+    from skillopt_sleep.types import SessionDigest
+
+    rollouts = 3
+    backend = PiCliBackend()
+    provider = _FakePiProvider(backend, _PI_CHECKS[route])
+    digests = [
+        SessionDigest(
+            session_id=f"session-{index}",
+            project="/project",
+            user_prompts=[intent],
+            assistant_finals=["done"],
+        )
+        for index, intent in enumerate(_PI_INTENTS)
+    ]
+    project = tmp_path / "project"
+    project.mkdir()
+    config = load_config(
+        invoked_project=str(project),
+        projects="invoked",
+        backend="pi",
+        state_dir=str(tmp_path / "state"),
+        claude_home=str(tmp_path / ".claude"),
+        evolve_memory=False,
+        dream_adversarial=1,
+        dream_adversarial_blocking=True,
+        dream_adversarial_rollouts=rollouts,
+        auto_adopt=False,
+    )
+    with mock.patch("skillopt_sleep.backend.subprocess.run", side_effect=provider):
+        tasks = mine(digests, llm_miner=make_llm_miner(backend), max_tasks=10, seed=42)
+        outcome = run_sleep_cycle(config, seed_tasks=tasks, backend=backend)
+
+    assert {task.judge["checks"][0]["op"] for task in tasks} == {
+        _PI_CHECKS[route]["op"]
+    }
+    trial = outcome.report.gate_trials[0]
+    probe = trial["adversarial_probe"]
+    assert trial["accepted"] is True
+    assert trial["blocked_by_adversarial"] is False
+    assert probe["n_flagged"] == 0
+    n_pairs = probe["n_probes"]
+    assert n_pairs == probe["n_sources"] == 3
+    # The single provider failure is visible as exactly one failed rollout.
+    candidate_probe_samples = [
+        score for row in probe["rows"] for score in row["samples"]["candidate_probe"]
+    ]
+    assert candidate_probe_samples.count(0.0) == 1
+    assert provider.failed_once
+
+    # Provider-boundary call counts in the probe phase. Probe prompts are new,
+    # so every rollout of every probe reaches the provider in both arms. The
+    # candidate's source prompts are also new. Baseline source rollout zero is
+    # byte-identical to the training replay under the same documents, so it is
+    # served from that cache entry; rollouts one and two still reach Pi.
+    calls = Counter(provider.probe_calls)
+    assert calls[("candidate", "probe")] == rollouts * n_pairs
+    assert calls[("baseline", "probe")] == rollouts * n_pairs
+    assert calls[("candidate", "source")] == rollouts * n_pairs
+    assert calls[("baseline", "source")] == (rollouts - 1) * n_pairs
+
+
+def test_inherited_tool_fallback_forwards_sample_id_to_the_attempt_cache() -> None:
+    from unittest import mock
+
+    from skillopt_sleep.backend import PiCliBackend
+    from skillopt_sleep.replay import replay_one
+
+    backend = PiCliBackend()
+    provider = _FakePiProvider(backend, _PI_CHECKS["tool"])
+    task = TaskRecord(
+        id="tool-task",
+        project="/project",
+        intent=_PI_INTENTS[0],
+        reference_kind="rule",
+        judge={"kind": "rule", "checks": [_PI_CHECKS["tool"]]},
+    )
+    with mock.patch(
+        "skillopt_sleep.backend.subprocess.run", side_effect=provider
+    ) as run:
+        for sample_id in (0, 1, 2, 0, 1):
+            result = replay_one(backend, task, _PI_RULE, "", sample_id=sample_id)
+            assert result.tools_called == ["search"]
+            assert result.hard == 1.0
+    # Three distinct samples reach Pi; repeats of a sample id stay cached.
+    assert run.call_count == 3
+    assert backend.distinct_samples(tools=True) is True
+    assert backend.distinct_samples(tools=False) is True
+
+
+@pytest.mark.parametrize("route", ["tool", "text"])
+def test_dream_rollouts_of_a_tool_task_reach_the_provider_as_distinct_samples(
+    route,
+) -> None:
+    """The same dropped ``sample_id`` also collapsed mainline dream rollouts:
+    ``multi_rollout`` of a ``tool_called`` task made one Pi call and reported
+    K identical scores, so contrastive reflection never saw any spread."""
+    import itertools
+    import subprocess
+    from unittest import mock
+
+    from skillopt_sleep.backend import PiCliBackend
+    from skillopt_sleep.rollout import multi_rollout
+
+    counter = itertools.count()
+
+    def stochastic_provider(cmd, *, input, **kwargs):
+        # Alternates between calling the tool and answering without it.
+        if next(counter) % 2 == 0:
+            out = "TOOL_CALL: search\nanswer"
+        else:
+            out = "answer without the tool"
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    check = (
+        {"op": "tool_called", "arg": "search"}
+        if route == "tool"
+        else {"op": "contains", "arg": "TOOL_CALL"}
+    )
+    task = TaskRecord(
+        id="dream-task",
+        project="/project",
+        intent="Please look it up",
+        reference_kind="rule",
+        judge={"kind": "rule", "checks": [check]},
+    )
+    with mock.patch(
+        "skillopt_sleep.backend.subprocess.run", side_effect=stochastic_provider
+    ) as run:
+        rollout_set = multi_rollout(PiCliBackend(), task, "skill", "", k=4, workers=1)
+    assert run.call_count == 4
+    assert [attempt.hard for attempt in rollout_set.attempts] == [1.0, 0.0, 1.0, 0.0]
+
+
+def test_dual_backend_forwards_tool_sample_ids_to_the_target() -> None:
+    seen: list[int] = []
+
+    class _Target(MockBackend):
+        def attempt(self, task, skill, memory, sample_id=0):
+            seen.append(sample_id)
+            return "TOOL_CALL: search"
+
+    task = TaskRecord(
+        id="tool-task",
+        project="/project",
+        intent="Please search",
+        reference_kind="rule",
+        judge={"kind": "rule", "checks": [{"op": "tool_called", "arg": "search"}]},
+    )
+    from skillopt_sleep.replay import repeated_samples_distinct, replay_one
+
+    dual = DualBackend(_Target(), MockBackend())
+    for sample_id in range(3):
+        replay_one(dual, task, "", "", sample_id=sample_id)
+    assert seen == [0, 1, 2]
+    assert repeated_samples_distinct(dual, task) is True
+
+
+def test_every_shipped_backend_route_claims_distinct_samples() -> None:
+    from skillopt_sleep import backend as backend_module
+
+    shipped = [
+        backend_module.MockBackend,
+        backend_module.PiCliBackend,
+        backend_module.ClaudeCliBackend,
+        backend_module.OpenCodeCliBackend,
+        backend_module.CodexCliBackend,
+        backend_module.CopilotCliBackend,
+        backend_module.CursorCliBackend,
+        backend_module.AzureOpenAIBackend,
+        backend_module.AzureResponsesBackend,
+    ]
+    for cls in shipped:
+        # distinct_samples inspects method signatures only, so no CLI, network,
+        # or credential set-up is needed to evaluate the route contract.
+        instance = cls.__new__(cls)
+        assert instance.distinct_samples(tools=False) is True, cls.__name__
+        assert instance.distinct_samples(tools=True) is True, cls.__name__
+
+
+class _LegacyToolBackend(_RobustCandidateBackend):
+    """A third-party backend written before repeated rollouts existed."""
+
+    def __init__(self) -> None:
+        self.attempt_calls = 0
+
+    def attempt(self, task, skill, memory):  # no sample_id parameter
+        self.attempt_calls += 1
+        if self.RULE not in f"{skill}\n{memory}":
+            return "wrong"
+        return task.reference
+
+    def attempt_with_tools(self, task, skill, memory, tools):
+        return self.attempt(task, skill, memory), list(tools)
+
+
+def _tool_tasks() -> list[TaskRecord]:
+    tasks = _candidate_tasks()
+    for task in tasks:
+        task.reference_kind = "rule"
+        task.judge = {
+            "kind": "rule",
+            "checks": [
+                {"op": "tool_called", "arg": "search"},
+                {"op": "contains", "arg": "ok"},
+            ],
+        }
+    return tasks
+
+
+def test_route_without_distinct_samples_is_inconclusive_not_brittle() -> None:
+    backend = _LegacyToolBackend()
+    before = backend.attempt_calls
+    report = evaluate_adversarial_probes(
+        backend,
+        _tool_tasks(),
+        _LegacyToolBackend.RULE,
+        "",
+        baseline_skill="",
+        baseline_memory="",
+        rollouts=3,
+    )
+    assert backend.distinct_samples(tools=True) is False
+    assert report["n_probes"] == 1
+    assert report["n_inconclusive"] == 1
+    assert report["n_flagged"] == 0
+    assert report["flagged"] is False
+    assert report["conclusive"] is False
+    assert report["brittleness_rate"] == 0.0
+    row = report["rows"][0]
+    assert row["status"] == "inconclusive"
+    assert row["distinct_samples"] is False
+    assert row["inconclusive_reason"] == "repeated_samples_unsupported"
+    assert row["gap_change"] is None and row["samples"] == {}
+    # Collapsed rollouts are not replayed at all, so they cost nothing.
+    assert backend.attempt_calls == before
+    json.dumps(report, allow_nan=False)
+
+
+def test_single_rollout_makes_no_independence_claim_on_a_legacy_route() -> None:
+    report = evaluate_adversarial_probes(
+        _LegacyToolBackend(),
+        _tool_tasks(),
+        _LegacyToolBackend.RULE,
+        "",
+        baseline_skill="",
+        baseline_memory="",
+        rollouts=1,
+    )
+    assert report["n_inconclusive"] == 0
+    assert report["conclusive"] is True
+    assert report["rows"][0]["status"] == "stable"
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_legacy_route_inconclusive_evidence_in_the_gate_and_report(
+    tmp_path, blocking
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    config = load_config(
+        invoked_project=str(project),
+        projects="invoked",
+        backend="mock",
+        state_dir=str(tmp_path / "state"),
+        claude_home=str(tmp_path / ".claude"),
+        evolve_memory=False,
+        dream_adversarial=1,
+        dream_adversarial_blocking=blocking,
+        dream_adversarial_rollouts=2,
+        auto_adopt=False,
+    )
+    outcome = run_sleep_cycle(
+        config, seed_tasks=_tool_tasks(), backend=_LegacyToolBackend()
+    )
+
+    trial = outcome.report.gate_trials[0]
+    probe = trial["adversarial_probe"]
+    assert probe["n_inconclusive"] == 1 and probe["conclusive"] is False
+    # Advisory evidence never changes the decision; blocking fails closed with
+    # a reason that names the unsupported route rather than a score drop.
+    assert trial["blocked_by_adversarial"] is blocking
+    assert probe["block_reason"] == (
+        "inconclusive_repeated_samples_unsupported" if blocking else ""
+    )
+    with open(
+        os.path.join(outcome.staging_dir, "report.md"), encoding="utf-8"
+    ) as handle:
+        markdown = handle.read()
+    assert (
+        "1 probe(s) inconclusive: their replay route cannot produce distinct "
+        "repeated samples, so they were not scored and cannot flag the candidate."
+    ) in markdown
+    assert "No conclusive probe was scored; blocking mode fails closed" in markdown
+    assert (
+        "| `train` | `train_adversarial_request-frame` | request-frame | "
+        "— | — | — | — | — | inconclusive |"
+    ) in markdown
