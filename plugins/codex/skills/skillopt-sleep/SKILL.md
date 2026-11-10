@@ -134,6 +134,7 @@ without `crontab`, `schedule` prints a line for manual installation.
 - **`gate_mode`** — `on` (validation-gated, default) or `off` (greedy)
 - **`gate_metric`** — `hard` | `soft` | `mixed` (default)
 - **`gate_no_regression`** — `false` by default; set it to `true` to reject a candidate when any validation task's gate score decreases
+- **`gate_rollouts`** — `1` by default; set it to N above 1 to score each validation task on N samples and gate on the mean
 - **`dream_rollouts`** — >1 for multi-rollout contrastive reflection
 - **`recall_k`** — >0 recalls similar past tasks from the archive
 

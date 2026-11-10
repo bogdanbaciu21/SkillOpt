@@ -173,6 +173,8 @@ commits, or generated summaries.
 `gate_no_regression` is a config-only safeguard in
 `~/.skillopt-sleep/config.json`. It defaults to `false`; set it to `true` to
 reject a candidate when any validation task's configured gate score decreases.
+`gate_rollouts` is config-only as well. It defaults to `1`; set it to N above 1
+to score each validation task on N samples and gate on the mean.
 
 ## Scheduling
 

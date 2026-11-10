@@ -35,6 +35,34 @@ candidate; an absent numeric score aborts evaluation. Task-level changes are
 included in `report.md`, `report.json`, `diagnostics.json`, the CLI's `--json`
 output, and the evidence log.
 
+The optional `gate_rollouts` config key sets how many samples of each
+validation task every gate comparison draws. It defaults to `1`, the single
+replay per task the gate has always used, and accepts a whole number up to 16.
+With a value N above 1, the baseline, each intermediate skill and memory
+candidate, and the fresh final replay each draw N samples of every validation
+task and compare mean scores; when `gate_no_regression` is enabled it compares
+the per-task means. A night's validation slice is usually a handful of tasks,
+and with one sample per task a candidate that really improves a stochastic
+agent often ties with the baseline and is rejected. Repeated samples give the
+gate more evidence from the same held-out tasks without moving any task out of
+training. They make exact ties rare, so the gate also accepts more candidates
+whose effect is nil; they do not make it better at rejecting a candidate that
+is harmful on tasks the slice does not contain.
+
+The cost is N validation replays per task per comparison; training replay,
+dream rollouts, and reflection are unchanged. Two cases draw one sample
+whatever the setting: a task whose judge requires a tool call, because the
+tool route takes no sample id, and every task on a night whose validation
+slice is not disjoint from training, because that night is never certified.
+Every sample is written to the evidence log with its `sample_id`. When the
+key is above one, the gate records carry `gate_rollouts`, the held-out detail
+lists each task's sample scores, and `report.md` shows the configured value;
+with the key unset, records and reports are what they were. An invalid value
+stops the run before any model call. On `mock`, and on `handoff`, where the same prompt
+maps to the same answer file, every sample returns the same answer; `handoff`
+still counts each sample toward the token total, so leave the setting at `1`
+there.
+
 Rule-based heading checks are intentionally additive. `section_present` keeps
 its legacy strict behavior for existing task sets: an ATX heading cannot append
 text after the requested name. Use `section_contains` when a numbered,
@@ -467,7 +495,9 @@ can end above the budget by the cost of one step: the first replay of the
 validation and training tasks, one edit step (a training replay, a reflect
 call and a validation replay of the candidate; with `dream_rollouts` set to K,
 K attempts per training task), the final validation replay, or the held-out
-test replay. Each fan-out group that starts runs its own first replay.
+test replay. With `gate_rollouts` set to N, every validation replay draws N
+samples per validation task, and the budget is not checked between samples.
+Each fan-out group that starts runs its own first replay.
 
 Spend comes from the backend's token counter, the one the report header prints
 as `tokens used`. The header shows the backend's running total and the note
@@ -504,8 +534,8 @@ This runs one additional consolidation per group (including a catch-all group wh
 hinted and unhinted evidence are mixed), so it multiplies backend calls and token
 use; configured dream rollouts and synthetic variants multiply the per-group work
 too. Each group inherits the configured edit budget, gate mode/metric,
-`gate_no_regression`, `dream_rollouts`, `dream_factor`, `recall_k`, and
-`evolve_skill`. Recalled archive tasks are restricted to that same skill hint;
+`gate_no_regression`, `gate_rollouts`, `dream_rollouts`, `dream_factor`,
+`recall_k`, and `evolve_skill`. Recalled archive tasks are restricted to that same skill hint;
 shared memory is read-only in fan-out runs. Setting `evolve_skill` to `false`
 therefore disables per-skill proposals as well as the managed skill proposal.
 

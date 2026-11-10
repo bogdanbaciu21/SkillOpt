@@ -3724,6 +3724,7 @@ class TestMultiSkillReportWiring(unittest.TestCase):
                 gate_metric="mixed",
                 gate_mixed_weight=0.37,
                 gate_no_regression=True,
+                gate_rollouts=3,
                 gate_mode="off",
                 evolve_skill=True,
                 evolve_memory=True,
@@ -3799,6 +3800,7 @@ class TestMultiSkillReportWiring(unittest.TestCase):
                 "gate_metric": "mixed",
                 "gate_mixed_weight": 0.37,
                 "gate_no_regression": True,
+                "gate_rollouts": 3,
                 "gate_mode": "off",
                 "evolve_skill": True,
             }

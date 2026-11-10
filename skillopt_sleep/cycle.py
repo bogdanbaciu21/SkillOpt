@@ -24,7 +24,7 @@ from skillopt_sleep import evidence
 from skillopt_sleep.backend import Backend, CursorBackendError, build_backend
 from skillopt_sleep.budget import Budget
 from skillopt_sleep.config import DEFAULTS, SleepConfig, load_config
-from skillopt_sleep.consolidate import BUDGET_EXHAUSTED
+from skillopt_sleep.consolidate import BUDGET_EXHAUSTED, gate_rollouts_count
 from skillopt_sleep.dream import dream_consolidate
 from skillopt_sleep.evidence import EvidenceLog
 from skillopt_sleep.handoff_backend import PendingCalls
@@ -360,6 +360,14 @@ def _edit_sources_md(edit) -> str:
     )
 
 
+def _gate_rollouts(cfg: SleepConfig) -> int:
+    """Samples per validation task for every gate comparison.
+
+    Raises ``ValueError`` for anything that is not a whole number in range.
+    """
+    return gate_rollouts_count(cfg.get("gate_rollouts", 1))
+
+
 def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
     project = _markdown_text(report.project)
     backend = _markdown_text(cfg.get("backend"))
@@ -387,6 +395,9 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
     gate_on = str(cfg.get("gate_mode", "on")).strip().lower() not in {
         "off", "none", "false", "greedy",
     }
+    gate_rollouts = _gate_rollouts(cfg)
+    if gate_on and gate_rollouts > 1:
+        lines.insert(-1, f"- validation samples per task: {gate_rollouts}")
     leaked_banner = report.holdout_leaked and gate_on
     if leaked_banner:
         lines[-1:] = [
@@ -723,6 +734,7 @@ def run_sleep_cycle(
     # Checked before the night writes anything (state, staging dir, evidence).
     harvest_source = normalize_transcript_source(cfg.get("transcript_source"))
     budget = _night_token_budget(cfg)
+    _gate_rollouts(cfg)  # reject an invalid value before any model call
     state = SleepState.load(cfg.state_path)
     project = _project_paths(cfg)
 
@@ -802,6 +814,8 @@ def run_sleep_cycle(
             "max_tasks_per_night", "max_tokens_per_night",
             "lookback_hours", "llm_mine",
             "evolve_skill", "evolve_memory")}
+        if _gate_rollouts(cfg) > 1:
+            cycle_config["gate_rollouts"] = _gate_rollouts(cfg)
         cycle_config["opencode_tool_replay"] = (
             cfg.get("opencode_tool_replay", False) is True
         )
@@ -976,6 +990,7 @@ def run_sleep_cycle(
             gate_metric=cfg.get("gate_metric", "mixed"),
             gate_mixed_weight=cfg.get("gate_mixed_weight", 0.5),
             gate_no_regression=cfg.get("gate_no_regression", False),
+            gate_rollouts=_gate_rollouts(cfg),
             gate_mode=cfg.get("gate_mode", "on"),
             evolve_skill=cfg.get("evolve_skill", True),
             evolve_memory=cfg.get("evolve_memory", True),
@@ -1082,6 +1097,7 @@ def run_sleep_cycle(
                     gate_metric=cfg.get("gate_metric", "mixed"),
                     gate_mixed_weight=cfg.get("gate_mixed_weight", 0.5),
                     gate_no_regression=cfg.get("gate_no_regression", False),
+                    gate_rollouts=_gate_rollouts(cfg),
                     gate_mode=cfg.get("gate_mode", "on"),
                     evolve_skill=cfg.get("evolve_skill", True),
                     night=night,

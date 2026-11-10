@@ -9,8 +9,11 @@ validation gate, vendored self-contained in ``skillopt_sleep.gate``.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
+import os
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
+from fractions import Fraction
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
 from skillopt_sleep.backend import Backend
 
@@ -18,7 +21,12 @@ from skillopt_sleep.backend import Backend
 # research package, so this open-source tool stays decoupled from the paper code).
 from skillopt_sleep.gate import evaluate_gate, select_gate_score
 from skillopt_sleep.memory import apply_edits_detailed
-from skillopt_sleep.replay import aggregate_scores, replay_batch
+from skillopt_sleep.replay import (
+    _required_tools,
+    aggregate_scores,
+    replay_batch,
+    replay_one,
+)
 from skillopt_sleep.types import (
     EditRecord,
     ReplayResult,
@@ -31,6 +39,9 @@ _HAVE_REPO_GATE = True
 # gate_action of an epoch that never ran because the token budget was spent.
 # Its scores were not measured, so callers must not report them as results.
 BUDGET_EXHAUSTED = "budget_exhausted"
+
+# Most samples per validation task a gate comparison may draw.
+GATE_ROLLOUTS_MAX = 16
 
 
 def _finite_score(value: float) -> float | None:
@@ -146,6 +157,141 @@ def _holdout_detail(pairs: List[Tuple[TaskRecord, ReplayResult]]) -> List[dict]:
     return out
 
 
+def gate_rollouts_count(value: object) -> int:
+    """Validate ``gate_rollouts``: a whole number from 1 to ``GATE_ROLLOUTS_MAX``.
+
+    ``None`` means the default of one. Booleans, fractional or non-finite
+    numbers, strings and out-of-range values raise ``ValueError``.
+    """
+    if value is None:
+        return 1
+    whole = (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and float(value).is_integer()
+    )
+    if not whole or not 1 <= int(value) <= GATE_ROLLOUTS_MAX:
+        raise ValueError(
+            f"gate_rollouts must be a whole number from 1 to {GATE_ROLLOUTS_MAX}, "
+            f"got {value!r}"
+        )
+    return int(value)
+
+
+def _exact_mean(values: List[float]) -> float:
+    """Mean of float scores computed exactly and rounded once.
+
+    A plain float mean of thirds or fifths depends on the order of the
+    additions, so two arms with the same passes in different places could
+    differ in the last bit and turn a tie into an accept. A non-finite score
+    yields NaN, which no comparison accepts.
+    """
+    if not values or not all(math.isfinite(v) for v in values):
+        return math.nan
+    return float(sum(Fraction(v) for v in values) / len(values))
+
+
+def _mean_result(samples: List[ReplayResult]) -> ReplayResult:
+    """Collapse repeated replays of one validation task into one result.
+
+    ``hard`` and ``soft`` are the sample means, which is what the gate
+    compares. Token and latency costs are summed, so the cost fields report
+    what the repeated replays spent. The text fields come from the
+    lowest-scoring sample, so the held-out detail of a task that failed on some
+    samples shows a failing response and its reason.
+    """
+    shown = min(samples, key=lambda r: (r.hard, r.soft))
+    tools: List[str] = []
+    for result in samples:
+        for name in result.tools_called:
+            if name not in tools:
+                tools.append(name)
+    return replace(
+        shown,
+        hard=_exact_mean([r.hard for r in samples]),
+        soft=_exact_mean([r.soft for r in samples]),
+        tokens=sum(r.tokens for r in samples),
+        latency_ms=sum(r.latency_ms for r in samples),
+        tools_called=tools,
+    )
+
+
+class _ValidationReplay(NamedTuple):
+    pairs: List[Tuple[TaskRecord, ReplayResult]]   # one per task; scores are sample means
+    hard: float                                    # mean over tasks of the task means
+    soft: float
+    samples: List[List[ReplayResult]]              # the draws behind each pair
+
+
+def _replay_validation(
+    backend: Backend,
+    tasks: List[TaskRecord],
+    skill: str,
+    memory: str,
+    rollouts: int,
+) -> _ValidationReplay:
+    """Replay the validation slice with up to ``rollouts`` samples per task.
+
+    With one sample per task the gate compares two single draws of a
+    stochastic agent on a handful of tasks, so a real improvement often shows
+    up as a tie and is rejected. With ``rollouts`` above one, each task whose
+    replay is a plain model call is drawn ``rollouts`` times with distinct
+    sample ids (the mechanism dream rollouts use, so a caching backend
+    resamples) and scored by the mean of its draws.
+
+    A task whose judge requires a tool call is replayed once: the tool route
+    takes no sample id, so a repeat is not a distinct draw on every backend
+    and is a full agent run on the others.
+
+    Sample 0 is the unchanged ``replay_batch`` call. A task that call returns
+    no result for stays missing, so the task-level comparison still fails
+    closed. ``rollouts <= 1`` is exactly the single replay the gate has always
+    used.
+    """
+    first = replay_batch(backend, tasks, skill, memory)
+    if rollouts <= 1 or not first:
+        hard, soft = aggregate_scores(first)
+        return _ValidationReplay(first, hard, soft, [[r] for _t, r in first])
+    samples: List[List[ReplayResult]] = [[result] for _task, result in first]
+    jobs = [
+        (index, task, sample_id)
+        for index, (task, _result) in enumerate(first)
+        if not _required_tools(task)
+        for sample_id in range(1, rollouts)
+    ]
+
+    def _draw(job: Tuple[int, TaskRecord, int]) -> ReplayResult:
+        _index, task, sample_id = job
+        return replay_one(backend, task, skill, memory, sample_id)
+
+    workers = int(os.environ.get("SKILLOPT_SLEEP_WORKERS", "1") or "1")
+    if workers > 1 and len(jobs) > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+            drawn = list(pool.map(_draw, jobs))
+    else:
+        drawn = [_draw(job) for job in jobs]
+    for (index, _task, _sample_id), result in zip(jobs, drawn):
+        samples[index].append(result)
+    pairs = [
+        (task, _mean_result(samples[index]))
+        for index, (task, _result) in enumerate(first)
+    ]
+    return _ValidationReplay(
+        pairs,
+        _exact_mean_of_means([[r.hard for r in draws] for draws in samples]),
+        _exact_mean_of_means([[r.soft for r in draws] for draws in samples]),
+        samples,
+    )
+
+
+def _exact_mean_of_means(groups: List[List[float]]) -> float:
+    """Mean over tasks of each task's mean, exact until the final rounding."""
+    if not groups or not all(math.isfinite(v) for group in groups for v in group):
+        return math.nan
+    total = sum(sum(Fraction(v) for v in group) / len(group) for group in groups)
+    return float(total / len(groups))
+
+
 def _task_deltas(
     tasks: List[TaskRecord],
     baseline_pairs: List[Tuple[TaskRecord, ReplayResult]],
@@ -217,6 +363,7 @@ def consolidate(
     gate_no_regression: bool = False,
     gate_mode: str = "on",       # "on" (hard/soft per gate_metric) | "off" (greedy)
     rollouts_k: int = 1,         # >1 => multi-rollout contrastive reflection
+    gate_rollouts: int = 1,      # >1 => gate on the mean of N samples per val task
     evolve_skill: bool = True,
     evolve_memory: bool = True,
     night: int = 1,
@@ -231,6 +378,13 @@ def consolidate(
 
     Skill and memory are evolved in sequence (skill first if both enabled).
 
+    ``gate_rollouts`` is how many samples of each validation task every gate
+    comparison draws (baseline, each edit trial and the final decision); a
+    task's score is the mean of its samples. Tasks that require a tool call
+    are sampled once, and so is everything on a night whose validation slice
+    is not disjoint from training. Training replay, dream rollouts and
+    reflection are not affected.
+
     ``budget_exhausted`` is checked before the epoch starts, before each
     evolve target and before the final validation replay. Once it returns
     True, the steps that have not started are skipped and listed in
@@ -243,6 +397,14 @@ def consolidate(
     ev = evlog.get(backend)
     train_tasks, val_tasks, holdout_leaked = _split(tasks)
     gate_off = str(gate_mode).strip().lower() in {"off", "none", "false", "greedy"}
+    gate_samples = gate_rollouts_count(gate_rollouts)
+    # Records carry the field only when the key is set above one, so a run
+    # with the default writes exactly the records it wrote before.
+    record_samples = gate_samples > 1
+    if holdout_leaked:
+        # A night without a disjoint validation slice is never certified, so
+        # extra samples of it would be spent on a decision already made.
+        gate_samples = 1
     holdout_detail: List[dict] = []
     budget_skipped: List[str] = []
 
@@ -279,15 +441,21 @@ def consolidate(
         base_pairs: List[Tuple[TaskRecord, ReplayResult]] = []
     else:
         evlog.set_phase(backend, "baseline_val")
-        base_pairs = replay_batch(backend, val_tasks, skill, memory)
-        base_hard, base_soft = aggregate_scores(base_pairs)
+        base_replay = _replay_validation(backend, val_tasks, skill, memory, gate_samples)
+        base_pairs, base_hard, base_soft = base_replay[:3]
         holdout_detail = _holdout_detail(base_pairs)
+        if gate_samples > 1:
+            for row, draws in zip(holdout_detail, base_replay.samples):
+                row["samples"] = len(draws)
+                row["sample_hard"] = [r.hard for r in draws]
     base_score = select_gate_score(base_hard, base_soft, gate_metric, gate_mixed_weight)
     if ev is not None:
         ev.log("gate", "baseline", gate_mode=("off" if gate_off else "on"),
                n_train=len(train_tasks), n_val=len(val_tasks),
                hard=base_hard, soft=base_soft, score=base_score,
-               metric=gate_metric, mixed_weight=gate_mixed_weight)
+               metric=gate_metric, mixed_weight=gate_mixed_weight,
+               **({"gate_rollouts": 0 if gate_off else gate_samples}
+                  if record_samples else {}))
 
     # ── reflect over TRAIN-split failures/successes ───────────────────────
     evlog.set_phase(backend, "train")
@@ -301,13 +469,14 @@ def consolidate(
     all_unmatched: List[EditRecord] = []
     gate_trials: List[dict] = []
     current_pairs = base_pairs
+    current_scores = (base_hard, base_soft)
 
     def _edits_payload(edits: List[EditRecord]) -> List[dict]:
         return [{"op": e.op, "content": e.content, "anchor": e.anchor,
                  "rationale": e.rationale} for e in edits]
 
     def _gate_apply(doc: str, edits: List[EditRecord], which: str) -> str:
-        nonlocal cand_skill, cand_memory, base_score, current_pairs
+        nonlocal cand_skill, cand_memory, base_score, current_pairs, current_scores
         nonlocal all_applied, all_rejected
         if ev is not None:
             ev.log("reflect", "edits_returned", target=which,
@@ -333,8 +502,9 @@ def consolidate(
         trial_skill = new_doc if which == "skill" else cand_skill
         trial_memory = new_doc if which == "memory" else cand_memory
         evlog.set_phase(backend, f"gate_trial:{which}")
-        pairs = replay_batch(backend, val_tasks, trial_skill, trial_memory)
-        h, s = aggregate_scores(pairs)
+        pairs, h, s = _replay_validation(
+            backend, val_tasks, trial_skill, trial_memory, gate_samples
+        )[:3]
         cand_score = select_gate_score(h, s, gate_metric, gate_mixed_weight)
         task_deltas = _task_deltas(
             val_tasks, current_pairs, pairs, gate_metric, gate_mixed_weight
@@ -351,6 +521,7 @@ def consolidate(
             "candidate_score": _finite_score(cand_score),
             "accepted": improved,
             "blocked_by_regression": blocked_by_regression,
+            **({"gate_rollouts": gate_samples} if record_samples else {}),
             "task_deltas": task_deltas,
         })
         if ev is not None:
@@ -358,11 +529,13 @@ def consolidate(
                    baseline_score=trial_base_score, cand_hard=h, cand_soft=s,
                    cand_score=cand_score, accepted=improved,
                    blocked_by_regression=blocked_by_regression,
+                   **({"gate_rollouts": gate_samples} if record_samples else {}),
                    task_deltas=task_deltas,
                    n_edits=len(applied))
         if improved:
             base_score = cand_score
             current_pairs = pairs
+            current_scores = (h, s)
             all_applied.extend(applied)
             return new_doc
         all_rejected.extend(applied)
@@ -455,10 +628,12 @@ def consolidate(
             # baseline replay, or the trial of the last edit kept), so decide
             # from that complete replay instead of starting a new one.
             final_pairs = current_pairs
+            final_hard, final_soft = current_scores
         else:
             evlog.set_phase(backend, "final_val")
-            final_pairs = replay_batch(backend, val_tasks, cand_skill, cand_memory)
-        final_hard, final_soft = aggregate_scores(final_pairs)
+            final_pairs, final_hard, final_soft = _replay_validation(
+                backend, val_tasks, cand_skill, cand_memory, gate_samples
+            )[:3]
         final_score = select_gate_score(final_hard, final_soft, gate_metric, gate_mixed_weight)
         base_gate_score = select_gate_score(base_hard, base_soft, gate_metric, gate_mixed_weight)
         final_task_deltas = _task_deltas(
@@ -525,6 +700,7 @@ def consolidate(
             "candidate_score": _finite_score(final_score),
             "accepted": accepted,
             "blocked_by_regression": final_blocked_by_regression,
+            **({"gate_rollouts": gate_samples} if record_samples else {}),
             "task_deltas": final_task_deltas,
         })
 
