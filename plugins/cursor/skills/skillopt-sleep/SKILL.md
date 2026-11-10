@@ -176,6 +176,8 @@ reject a candidate when any validation task's configured gate score decreases.
 `gate_train_check` is config-only as well. It defaults to `false`; set it to
 `true` to also reject a candidate that scores clearly lower on tonight's
 training tasks.
+`gate_rollouts` is config-only as well. It defaults to `1`; set it to N above 1
+to score each validation task on N samples and gate on the mean.
 
 ## Scheduling
 

@@ -111,6 +111,7 @@ Beyond the CLI flags, advanced behavior is controlled via config:
 - **`gate_metric`** — `hard`, `soft`, or `mixed` (default). Controls how the held-out gate scores.
 - **`gate_no_regression`** — `false` by default. Set to `true` to reject a candidate when any validation task's configured gate score decreases.
 - **`gate_train_check`** — `false` by default. Set to `true` to also reject a candidate that scores clearly lower than the current skill and memory on tonight's training tasks (mean lower by more than `gate_train_margin`, default `0.1`, on at least two more tasks than improved).
+- **`gate_rollouts`** — `1` by default. Set to N above 1 to score each validation task on N samples and gate on the mean.
 - **`dream_rollouts`** — >1 enables multi-rollout contrastive reflection per task.
 - **`recall_k`** — >0 recalls K similar past tasks into the dream (long-term memory).
 - **`evolve_memory`** / **`evolve_skill`** — independently toggle CLAUDE.md vs SKILL.md consolidation.

@@ -49,6 +49,8 @@ my preferences", or "make the agent improve from past usage", use the MCP tools:
   candidate when any validation task's configured gate score decreases
 - `gate_train_check` — `false` by default; set it to `true` to also reject a
   candidate that scores clearly lower on tonight's training tasks
+- `gate_rollouts` — `1` by default; set it to N above 1 to score each
+  validation task on N samples and gate on the mean
 - `dream_rollouts` — >1 for more signal
 - `evolve_memory` / `evolve_skill` — toggle which docs consolidate
 

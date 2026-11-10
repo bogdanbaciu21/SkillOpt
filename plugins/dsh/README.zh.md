@@ -26,6 +26,7 @@
   "gate_metric": "mixed",
   "gate_no_regression": false,
   "gate_train_check": false,
+  "gate_rollouts": 1,
   "dream_rollouts": 1,
   "recall_k": 0,
   "evolve_memory": true,

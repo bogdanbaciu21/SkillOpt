@@ -40,7 +40,7 @@ duplicated as a per-skill row.
 
 Each group inherits `recall_k`, `dream_rollouts`, `dream_factor`, `edit_budget`,
 `gate_mode`, `gate_metric`, `gate_mixed_weight`, `gate_no_regression`,
-`gate_train_check`, `gate_train_margin`, and `evolve_skill`. Recalled archive tasks are restricted to the same skill hint,
+`gate_train_check`, `gate_train_margin`, `gate_rollouts`, and `evolve_skill`. Recalled archive tasks are restricted to the same skill hint,
 and shared memory is read-only during group runs. Consequently,
 `evolve_skill=false` disables managed and fan-out skill proposals.
 

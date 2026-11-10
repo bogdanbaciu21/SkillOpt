@@ -38,6 +38,17 @@ All notable changes to SkillOpt are documented here. This project adheres to
   arms and every task-level change are kept in the gate records (`train_check`)
   and a `gate`/`train_check` evidence event, and `report.md` shows the two
   means and the counts. With the key unset, records and reports are unchanged.
+- **SkillOpt-Sleep `gate_rollouts`** config key (default `1`, the unchanged
+  single replay; whole numbers up to 16): every gate comparison (baseline,
+  each skill and memory candidate, and the final replay) draws N samples of
+  each validation task and compares the means, computed exactly so equal pass
+  counts stay a tie; `gate_no_regression` compares per-task means. Tasks that
+  require a tool call, and nights without a disjoint validation slice, draw
+  one sample. Training replay, dream rollouts, and reflection are not
+  affected. Each sample is in the evidence log with its `sample_id`. When the
+  key is above one, gate records carry `gate_rollouts`, the held-out detail
+  lists per-task sample scores, and `report.md` shows the configured value.
+  With the key unset, records and reports are unchanged.
 - **SkillOpt-Sleep paired A/B evalkit** (`python -m skillopt_sleep.evalkit`):
   McNemar plus percentile-bootstrap CIs on a fixed task manifest, with
   task-cluster multi-seed inference and seeded null calibration for exact-test
